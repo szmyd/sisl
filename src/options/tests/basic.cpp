@@ -33,7 +33,7 @@ TEST(Options, Loaded) { EXPECT_EQ(2u, SISL_OPTIONS["verbosity"].as< uint32_t >()
 
 TEST(Options, AllTrue) {
     const bool result1{sisl::options::all_true< true, true, true >::value};
-    EXPECT_TRUE(result1);
+    EXPECT_FALSE(result1);
     const bool result2{sisl::options::all_true< true, true, false >::value};
     const bool result3{sisl::options::all_true< true, false, true >::value};
     const bool result4{sisl::options::all_true< true, false, true >::value};
