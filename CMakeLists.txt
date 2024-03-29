@@ -3,6 +3,8 @@ project (sisl CXX)
 
 # Set Global CMake Options
 set_property(GLOBAL PROPERTY USE_FOLDERS ON) # turn on folder hierarchies
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib)
 
 include (cmake/Flags.cmake)
 
@@ -11,6 +13,7 @@ set(CMAKE_CXX_STANDARD 20)
 if (NOT BUILD_TESTING STREQUAL OFF)
   set(ENABLE_TESTING ON)
   enable_testing()
+  find_package(benchmark REQUIRED)
   find_package(GTest QUIET REQUIRED)
 endif()
 

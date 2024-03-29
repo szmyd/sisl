@@ -25,7 +25,6 @@ add_subdirectory(version)
 
 find_package(folly QUIET)
 if (${folly_FOUND})
-  find_package(benchmark REQUIRED)
   find_package(flatbuffers REQUIRED)
   find_package(prometheus-cpp REQUIRED)
   find_package(userspace-rcu REQUIRED)

@@ -1,7 +1,7 @@
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools.build import check_min_cppstd
-from conan.tools.cmake import CMakeToolchain, CMakeDeps, CMake, cmake_layout
+from conan.tools.cmake import CMakeToolchain, CMakeDeps, CMake
 from conan.tools.files import copy
 from os.path import join
 
@@ -72,9 +72,10 @@ class SISLConan(ConanFile):
                     raise ConanInvalidConfiguration("Coverage/Sanitizer requires Testing!")
 
     def build_requirements(self):
-        self.test_requires("gtest/1.14.0")
-        if self.options.metrics:
-            self.test_requires("benchmark/1.8.2")
+        if not self.conf.get("tools.build:skip_test", default=False):
+            self.test_requires("gtest/1.14.0")
+            if self.options.metrics:
+                self.test_requires("benchmark/1.8.2")
 
     def requirements(self):
         # Required
@@ -104,8 +105,27 @@ class SISLConan(ConanFile):
         elif self.options.malloc_impl == "jemalloc":
             self.requires("jemalloc/5.3.0", transitive_headers=True)
 
+    @property
+    def _components(self):
+        return ['options', 'logging', 'sobject', 'file_watcher', 'version', 'settings', 'metrics', 'buffer', 'cache', 'grpc', 'flip']
+
     def layout(self):
-        cmake_layout(self)
+        # Setup folder locations
+        self.folders.source = "."
+        self.folders.build = join("build", str(self.settings.build_type))
+        self.folders.generators = join(self.folders.build, "generators")
+
+        # Static headers
+        self.cpp.source.includedirs = ["include"]
+        self.cpp.source.builddirs = ["cmake"]
+
+
+        # Setup components
+        for c in self._components:
+            self.cpp.build.components[c].libs = [f"sisl_{c}"]
+            self.cpp.build.components[c].libdirs = ["./lib"]
+
+        self.cpp.build.components["sisl"].libs = [""]
 
     def generate(self):
         # This generates "conan_toolchain.cmake" in self.generators_folder
@@ -159,16 +179,12 @@ class SISLConan(ConanFile):
         copy(self, "*security_config_generated.h", join(self.build_folder, "src"), gen_dir, keep_path=True)
         copy(self, "settings_gen.cmake", join(self.source_folder, "cmake"), join(self.package_folder, "cmake"), keep_path=False)
 
+
     def package_info(self):
-        self.cpp_info.components["options"].libs = ["sisl_options"]
-        self.cpp_info.components["options"].set_property("pkg_config_name", f"libsisl_options")
         self.cpp_info.components["options"].requires.extend([
                 "boost::boost",
                 "cxxopts::cxxopts",
                 ])
-
-        self.cpp_info.components["logging"].libs = ["sisl_logging"]
-        self.cpp_info.components["logging"].set_property("pkg_config_name", f"libsisl_logging")
         self.cpp_info.components["logging"].requires.extend([
                 "options",
                 "boost::boost",
@@ -176,57 +192,41 @@ class SISLConan(ConanFile):
                 "nlohmann_json::nlohmann_json",
                 "spdlog::spdlog",
                 ])
-        self.cpp_info.components["logging"].sharedlinkflags.append("-rdynamic")
-        self.cpp_info.components["logging"].exelinkflags.append("-rdynamic")
-
-        self.cpp_info.components["sobject"].libs = ["sisl_sobject"]
-        self.cpp_info.components["sobject"].set_property("pkg_config_name", f"libsisl_sobject")
         self.cpp_info.components["sobject"].requires.extend([
                 "logging",
                 "nlohmann_json::nlohmann_json",
                 ])
-        self.cpp_info.components["file_watcher"].libs = ["sisl_file_watcher"]
-        self.cpp_info.components["file_watcher"].set_property("pkg_config_name", f"libsisl_file_watcher")
         self.cpp_info.components["file_watcher"].requires.extend([
                 "logging",
                 ])
-        self.cpp_info.components["version"].libs = ["sisl_version"]
-        self.cpp_info.components["version"].set_property("pkg_config_name", f"libsisl_version")
         self.cpp_info.components["version"].requires.extend([
                 "logging",
                 "zmarok-semver::zmarok-semver",
                 ])
-        self.cpp_info.components["sisl"].libs = [""]
         self.cpp_info.components["sisl"].requires.extend([
                 "file_watcher",
                 "sobject",
                 "version",
                 ])
+        self.cpp_info.components["logging"].sharedlinkflags.append("-rdynamic")
+        self.cpp_info.components["logging"].exelinkflags.append("-rdynamic")
+
         if self.options.metrics:
-            self.cpp_info.components["settings"].libs = ["sisl_settings"]
-            self.cpp_info.components["settings"].set_property("pkg_config_name", f"libsisl_settings")
             self.cpp_info.components["settings"].requires.extend([
                     "logging",
                     "flatbuffers::flatbuffers",
                     "userspace-rcu::userspace-rcu",
                     ])
-            self.cpp_info.components["metrics"].libs = ["sisl_metrics"]
-            self.cpp_info.components["metrics"].set_property("pkg_config_name", f"libsisl_metrics")
             self.cpp_info.components["metrics"].requires.extend([
                     "logging",
                     "folly::folly",
                     "prometheus-cpp::prometheus-cpp",
                     ])
-            self.cpp_info.components["buffer"].libs = ["sisl_buffer"]
-            self.cpp_info.components["buffer"].set_property("pkg_config_name", f"libsisl_buffer")
             self.cpp_info.components["buffer"].requires.extend([
                     "metrics",
                     "folly::folly",
                     "userspace-rcu::userspace-rcu",
                     ])
-
-            self.cpp_info.components["cache"].libs = ["sisl_cache"]
-            self.cpp_info.components["cache"].set_property("pkg_config_name", f"libsisl_cache")
             self.cpp_info.components["cache"].requires.extend([
                     "buffer",
                     ])
@@ -236,14 +236,10 @@ class SISLConan(ConanFile):
                     ])
 
         if self.options.grpc:
-            self.cpp_info.components["grpc"].libs = ["sisl_grpc"]
-            self.cpp_info.components["grpc"].set_property("pkg_config_name", f"libsisl_grpc")
             self.cpp_info.components["grpc"].requires.extend([
                     "buffer",
                     "grpc::grpc",
                     ])
-            self.cpp_info.components["flip"].libs = ["flip"]
-            self.cpp_info.components["flip"].set_property("pkg_config_name", f"libflip")
             self.cpp_info.components["flip"].requires.extend([
                     "logging",
                     "grpc::grpc",
