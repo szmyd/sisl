@@ -83,7 +83,7 @@ class FollyConan(ConanFile):
         # FIXME: Causing compilation issues on clang: self.requires("jemalloc/5.2.1")
         if self.settings.os in ["Linux", "FreeBSD"]:
             self.requires("libiberty/9.1.0")
-            self.requires("libunwind/1.7.2")
+            self.requires("libunwind/1.8.0")
         self.requires("fmt/10.2.1", transitive_headers=True, transitive_libs=True)
 
     @property

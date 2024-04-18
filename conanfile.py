@@ -9,7 +9,7 @@ required_conan_version = ">=1.60.0"
 
 class SISLConan(ConanFile):
     name = "sisl"
-    version = "12.1.1"
+    version = "12.1.2"
 
     homepage = "https://github.com/eBay/sisl"
     description = "Library for fast data structures, utilities"
@@ -89,7 +89,7 @@ class SISLConan(ConanFile):
 
         if self.options.metrics:
             self.requires("flatbuffers/23.5.26", transitive_headers=True)
-            self.requires("folly/nu2.2023.12.18.00", transitive_headers=True)
+            self.requires("folly/nu2.2023.12.18.01", transitive_headers=True)
             self.requires("prometheus-cpp/1.1.0", transitive_headers=True)
             self.requires("userspace-rcu/nu2.0.14.0", transitive_headers=True)
             self.requires("libcurl/8.4.0",  override=True)
