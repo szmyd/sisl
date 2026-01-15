@@ -26,6 +26,7 @@ class SISLConan(ConanFile):
                 "sanitize": ['True', 'False'],
                 'metrics': ['False', 'True'],
                 'grpc': ['False', 'True'],
+                'flip': ['False', 'True'],
                 'malloc_impl' : ['libc', 'tcmalloc', 'jemalloc'],
               }
     default_options = {
@@ -35,6 +36,7 @@ class SISLConan(ConanFile):
                 'sanitize': False,
                 'metrics': True,
                 'grpc': True,
+                'flip': True,
                 'malloc_impl': 'libc',
             }
 
@@ -61,6 +63,8 @@ class SISLConan(ConanFile):
             self.options['pistache'].with_ssl: True
         if self.options.shared:
             self.options.rm_safe("fPIC")
+        if not self.options.grpc:
+            self.options.rm_safe("flip")
         if self.settings.build_type == "Debug":
             if self.options.coverage and self.options.sanitize:
                 raise ConanInvalidConfiguration("Sanitizer does not work with Code Coverage!")
@@ -140,9 +144,10 @@ class SISLConan(ConanFile):
         if self.options.grpc:
             self.cpp.build.components["grpc"].libdirs = ["src/grpc"]
             self.cpp.package.components["grpc"].libs = ["sisl_grpc"]
-            self.cpp.build.components["flip"].includedirs = ["src/flip"]
-            self.cpp.build.components["flip"].libdirs = ["src/flip"]
-            self.cpp.package.components["flip"].libs = ["flip"]
+            if self.options.flip:
+                self.cpp.build.components["flip"].includedirs = ["src/flip"]
+                self.cpp.build.components["flip"].libdirs = ["src/flip"]
+                self.cpp.package.components["flip"].libs = ["flip"]
 
         self.cpp.package.includedirs = ["include"] # includedirs is already set to 'include' by
         self.cpp.package.libdirs = ["lib"]
@@ -154,9 +159,12 @@ class SISLConan(ConanFile):
         tc.variables["CTEST_OUTPUT_ON_FAILURE"] = "ON"
         tc.variables["MEMORY_SANITIZER_ON"] = "OFF"
         tc.variables["BUILD_COVERAGE"] = "OFF"
+        tc.variables["ENABLE_FLIP"] = "OFF"
         tc.variables['MALLOC_IMPL'] = self.options.malloc_impl
         tc.preprocessor_definitions["PACKAGE_VERSION"] = self.version
         tc.preprocessor_definitions["PACKAGE_NAME"] = self.name
+        if self.options.get_safe("flip"):
+            tc.variables["ENABLE_FLIP"] = "ON"
         if self.settings.build_type == "Debug":
             if self.options.get_safe("coverage"):
                 tc.variables['BUILD_COVERAGE'] = 'ON'
@@ -257,13 +265,17 @@ class SISLConan(ConanFile):
                     "buffer",
                     "grpc::grpc++",
                     ])
-            self.cpp_info.components["flip"].requires.extend([
-                    "logging",
-                    "grpc::grpc++",
-                    ])
             self.cpp_info.components["sisl"].requires.extend([
                     "grpc",
                     ])
+            if self.options.flip:
+                self.cpp_info.components["flip"].requires.extend([
+                        "grpc",
+                        "logging",
+                        ])
+                self.cpp_info.components["sisl"].requires.extend([
+                        "flip",
+                        ])
 
         for component in self.cpp_info.components.values():
             if self.settings.os in ["Linux", "FreeBSD"]:
