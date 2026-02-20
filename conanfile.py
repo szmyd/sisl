@@ -90,7 +90,7 @@ class SISLConan(ConanFile):
 
         # ARM needs unreleased versionof libunwind
         if not self.settings.arch in ['x86', 'x86_64']:
-            self.requires("libunwind/1.8.2@baydb/develop", override=True)
+            self.requires("libunwind/1.8.2", override=True)
 
         if self.options.metrics:
             self.requires("flatbuffers/24.12.23", transitive_headers=True)
