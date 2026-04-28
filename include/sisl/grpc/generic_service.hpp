@@ -60,8 +60,18 @@ public:
     void enqueue_call_request(::grpc::ServerCompletionQueue& cq) override;
 
     void send_response();
+
+    // Zero-copy overload: each blob is wrapped in a STATIC_SLICE, so gRPC holds a raw pointer into
+    // the blob memory for the duration of the write.  The caller MUST keep every blob in
+    // response_blob_list alive until after the write completes (i.e. until ~GenericRpcData() runs).
+    // The safe pattern is to allocate owned blobs and transfer them to a GenericRpcContextBase
+    // subclass stored via set_context(); the context is destroyed in ~GenericRpcData(), which fires
+    // only after the write has completed.  Never pass request_blob() directly — GenericRpcData owns
+    // that memory and may free it before gRPC finishes writing.
     void send_response(io_blob_list_t const& response_blob_list);
 
+    // Attach caller-managed state whose lifetime must extend to ~GenericRpcData() (post write-complete).
+    // Intended for keeping zero-copy response buffers alive when using send_response(io_blob_list_t).
     void set_context(generic_rpc_ctx_ptr ctx);
     GenericRpcContextBase* get_context();
 

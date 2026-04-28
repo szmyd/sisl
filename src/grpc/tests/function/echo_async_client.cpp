@@ -401,11 +401,34 @@ public:
         std::atomic< uint32_t > num_calls = 0ul;
         std::atomic< uint32_t > num_completions = 0ul;
 
+        // send_response(io_blob_list_t) uses STATIC_SLICE — the caller must keep blob data alive
+        // until after the gRPC write completes (on_buf_write fires).  We stash the blob in the
+        // RPC context, which is destroyed in ~GenericRpcData() after on_request_completed.
+        struct BlobContext : public GenericRpcContextBase {
+            sisl::io_blob blob;
+            explicit BlobContext(sisl::io_blob b) : blob{b} {}
+            ~BlobContext() override { blob.buf_free(); }
+        };
+
         template < typename BufT >
-        static void set_response(BufT const& req, grpc::ByteBuffer& resp, bool set_buf) {
+        static void set_response(BufT const& req, grpc::ByteBuffer& resp) {
             DataMessage cli_request;
             DeserializeFromBuffer(req, cli_request);
-            if (set_buf) { SerializeToByteBuffer(resp, cli_request); }
+            SerializeToByteBuffer(resp, cli_request);
+        }
+
+        // Exercises send_response(io_blob_list_t).  Always calls send_response() itself
+        // so it is only called from the async thread path.
+        static void echo_via_io_blob(const boost::intrusive_ptr< GenericRpcData >& rpc) {
+            DataMessage msg;
+            DeserializeFromBuffer(rpc->request_blob(), msg);
+            std::string s;
+            msg.SerializeToString(s);
+            sisl::io_blob blob{static_cast< uint32_t >(s.size())};
+            std::memcpy(voidptr_cast(blob.bytes()), c_voidptr_cast(s.data()), s.size());
+            // Keep blob alive until after the write completes (context freed in ~GenericRpcData).
+            rpc->set_context(std::make_unique< BlobContext >(blob));
+            rpc->send_response(io_blob_list_t{blob});
         }
 
     public:
@@ -419,20 +442,20 @@ public:
             auto const res =
                 server->register_generic_rpc(GENERIC_METHOD, [this](boost::intrusive_ptr< GenericRpcData >& rpc_data) {
                     rpc_data->set_comp_cb([this](boost::intrusive_ptr< GenericRpcData >&) { num_completions++; });
-                    if ((++num_calls % 2) == 0) {
-                        LOGDEBUGMOD(grpc_server, "respond async generic request, call_num {}", num_calls.load());
-                        std::thread([this, rpc = rpc_data] {
-                            if ((num_calls % 3) == 0) {
-                                set_response(rpc->request_blob(), rpc->response(), false);
-                                rpc->send_response(io_blob_list_t{rpc->request_blob()});
+                    auto call_n = ++num_calls;
+                    if ((call_n % 2) == 0) {
+                        LOGDEBUGMOD(grpc_server, "respond async generic request, call_num {}", call_n);
+                        std::thread([call_n, rpc = rpc_data] {
+                            if ((call_n % 3) == 0) {
+                                echo_via_io_blob(rpc);
                             } else {
-                                set_response(rpc->request_blob(), rpc->response(), true);
+                                set_response(rpc->request_blob(), rpc->response());
                                 rpc->send_response();
                             }
                         }).detach();
                         return false;
                     }
-                    set_response(rpc_data->request(), rpc_data->response(), true);
+                    set_response(rpc_data->request(), rpc_data->response());
                     return true;
                 });
             RELEASE_ASSERT(res, "register generic rpc failed");
