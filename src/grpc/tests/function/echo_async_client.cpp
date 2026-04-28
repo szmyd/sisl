@@ -219,7 +219,7 @@ public:
 
         void register_rpcs(GrpcServer* server) {
             LOGINFO("register echo rpc");
-            auto res = server->register_rpc< EchoService, EchoRequest, EchoReply, false >(
+            auto res = server->register_rpc< EchoService, EchoRequest, EchoReply >(
                 "Echo", &EchoService::AsyncService::RequestEcho,
                 [this](const AsyncRpcDataPtr< EchoService, EchoRequest, EchoReply >& rpc_data) {
                     if ((++num_calls % 2) == 0) {
@@ -248,7 +248,7 @@ public:
 
         void register_rpcs(GrpcServer* server) {
             LOGINFO("register ping rpc");
-            auto res = server->register_rpc< PingService, PingRequest, PingReply, false >(
+            auto res = server->register_rpc< PingService, PingRequest, PingReply >(
                 "Ping", &PingService::AsyncService::RequestPing,
                 [this](const AsyncRpcDataPtr< PingService, PingRequest, PingReply >& rpc_data) {
                     if ((++num_calls % 2) == 0) {
@@ -344,13 +344,13 @@ public:
     void start(const std::string& server_address) {
         LOGINFO("Starting echo/ping/generic server on {}", server_address);
         m_grpc_server = GrpcServer::make(server_address, 4, "", "", MAX_GRPC_RECV_SIZE);
-        m_echo_impl.register_service(m_grpc_server);
-        m_ping_impl.register_service(m_grpc_server);
-        m_generic_impl.register_service(m_grpc_server);
+        m_echo_impl.register_service(m_grpc_server.get());
+        m_ping_impl.register_service(m_grpc_server.get());
+        m_generic_impl.register_service(m_grpc_server.get());
         m_grpc_server->run();
-        m_echo_impl.register_rpcs(m_grpc_server);
-        m_ping_impl.register_rpcs(m_grpc_server);
-        m_generic_impl.register_rpcs(m_grpc_server);
+        m_echo_impl.register_rpcs(m_grpc_server.get());
+        m_ping_impl.register_rpcs(m_grpc_server.get());
+        m_generic_impl.register_rpcs(m_grpc_server.get());
         LOGINFO("Server listening on {}", server_address);
     }
 
@@ -359,11 +359,10 @@ public:
         RELEASE_ASSERT(m_generic_impl.check_counters(), "generic RPC call/completion counter mismatch");
         LOGINFO("Shutting down grpc server");
         m_grpc_server->shutdown();
-        delete m_grpc_server;
     }
 
 private:
-    GrpcServer* m_grpc_server{nullptr};
+    std::unique_ptr< GrpcServer > m_grpc_server;
     EchoServiceImpl m_echo_impl;
     PingServiceImpl m_ping_impl;
     GenericServiceImpl m_generic_impl;

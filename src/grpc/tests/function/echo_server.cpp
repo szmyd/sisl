@@ -53,7 +53,7 @@ public:
 
     bool register_rpcs(GrpcServer* server) {
         LOGINFO("register rpc calls");
-        if (!server->register_rpc< EchoService, EchoRequest, EchoReply, false >(
+        if (!server->register_rpc< EchoService, EchoRequest, EchoReply >(
                 "Echo", &EchoService::AsyncService::RequestEcho, std::bind(&EchoServiceImpl::echo_request, this, _1))) {
             LOGERROR("register rpc failed");
             return false;
@@ -84,7 +84,7 @@ public:
 
     bool register_rpcs(GrpcServer* server) {
         LOGINFO("register rpc calls");
-        if (!server->register_rpc< PingService, PingRequest, PingReply, false >(
+        if (!server->register_rpc< PingService, PingRequest, PingReply >(
                 "Ping", &PingService::AsyncService::RequestPing, std::bind(&PingServiceImpl::ping_request, this, _1))) {
             LOGERROR("register ping rpc failed");
             return false;
@@ -94,7 +94,7 @@ public:
     }
 };
 
-GrpcServer* g_grpc_server = nullptr;
+std::unique_ptr< GrpcServer > g_grpc_server;
 EchoServiceImpl* g_echo_impl = nullptr;
 PingServiceImpl* g_ping_impl = nullptr;
 
@@ -112,16 +112,16 @@ void StartServer() {
     g_grpc_server = GrpcServer::make(server_address, 4, "", "");
 
     g_echo_impl = new EchoServiceImpl();
-    g_echo_impl->register_service(g_grpc_server);
+    g_echo_impl->register_service(g_grpc_server.get());
 
     g_ping_impl = new PingServiceImpl();
-    g_ping_impl->register_service(g_grpc_server);
+    g_ping_impl->register_service(g_grpc_server.get());
 
     g_grpc_server->run();
     LOGINFO("Server listening on {}", server_address);
 
-    g_echo_impl->register_rpcs(g_grpc_server);
-    g_ping_impl->register_rpcs(g_grpc_server);
+    g_echo_impl->register_rpcs(g_grpc_server.get());
+    g_ping_impl->register_rpcs(g_grpc_server.get());
 }
 
 SISL_LOGGING_INIT(logging, grpc_server)
@@ -140,7 +140,6 @@ int main(int argc, char* argv[]) {
     }
 
     t.join();
-    delete g_grpc_server;
     delete g_echo_impl;
     delete g_ping_impl;
 

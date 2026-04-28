@@ -77,13 +77,13 @@ public:
 
     bool register_rpcs(GrpcServer* server) {
         LOGINFO("register rpc calls");
-        if (!server->register_rpc< EchoService, EchoRequest, EchoReply, false >(
+        if (!server->register_rpc< EchoService, EchoRequest, EchoReply >(
                 "Echo", &EchoService::AsyncService::RequestEcho,
                 std::bind(&EchoServiceImpl::echo_request, this, std::placeholders::_1))) {
             LOGERROR("register rpc failed");
             return false;
         }
-        if (!server->register_rpc< EchoService, EchoRequest, EchoReply, false >(
+        if (!server->register_rpc< EchoService, EchoRequest, EchoReply >(
                 "EchoMetadata", &EchoService::AsyncService::RequestEchoMetadata,
                 std::bind(&EchoServiceImpl::echo_request_metadata, this, std::placeholders::_1))) {
             LOGERROR("register rpc failed");
@@ -127,7 +127,6 @@ public:
     void TearDown() override {
         if (m_grpc_server) {
             m_grpc_server->shutdown();
-            delete m_grpc_server;
             delete m_echo_impl;
         }
     }
@@ -136,11 +135,11 @@ public:
         LOGINFO("Start echo server on {}...", server_address);
         m_grpc_server = GrpcServer::make(server_address, auth_mgr, 4, "", "");
         m_echo_impl = new EchoServiceImpl();
-        m_echo_impl->register_service(m_grpc_server);
+        m_echo_impl->register_service(m_grpc_server.get());
         m_grpc_server->register_async_generic_service();
         m_grpc_server->run();
         LOGINFO("Server listening on {}", server_address);
-        m_echo_impl->register_rpcs(m_grpc_server);
+        m_echo_impl->register_rpcs(m_grpc_server.get());
         m_grpc_server->register_generic_rpc(GENERIC_METHOD,
                                             [](boost::intrusive_ptr< GenericRpcData >&) { return true; });
     }
@@ -172,7 +171,7 @@ public:
 protected:
     std::shared_ptr< MockTokenVerifier > m_auth_mgr;
     EchoServiceImpl* m_echo_impl = nullptr;
-    GrpcServer* m_grpc_server = nullptr;
+    std::unique_ptr< GrpcServer > m_grpc_server;
     std::unique_ptr< GrpcAsyncClient > m_async_grpc_client;
     std::unique_ptr< GrpcAsyncClient::AsyncStub< EchoService > > m_echo_stub;
     std::unique_ptr< GrpcAsyncClient::GenericAsyncStub > m_generic_stub;
@@ -368,7 +367,6 @@ TEST(GenericServiceDeathTest, basic_test) {
     }
 
     g_grpc_server->shutdown();
-    delete g_grpc_server;
 }
 
 } // namespace sisl::grpc::testing

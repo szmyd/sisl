@@ -49,11 +49,14 @@ public:
     /**
      * Create a new GrpcServer instance and initialize it.
      */
-    static GrpcServer* make(const std::string& listen_addr, uint32_t threads = 1, const std::string& ssl_key = "",
-                            const std::string& ssl_cert = "", int max_receive_msg_size = 0, int max_send_msg_size = 0);
-    static GrpcServer* make(const std::string& listen_addr, const std::shared_ptr< sisl::GrpcTokenVerifier >& auth_mgr,
-                            uint32_t threads = 1, const std::string& ssl_key = "", const std::string& ssl_cert = "",
-                            int max_receive_msg_size = 0, int max_send_msg_size = 0);
+    static std::unique_ptr< GrpcServer > make(const std::string& listen_addr, uint32_t threads = 1,
+                                              const std::string& ssl_key = "", const std::string& ssl_cert = "",
+                                              int max_receive_msg_size = 0, int max_send_msg_size = 0);
+    static std::unique_ptr< GrpcServer > make(const std::string& listen_addr,
+                                              const std::shared_ptr< sisl::GrpcTokenVerifier >& auth_mgr,
+                                              uint32_t threads = 1, const std::string& ssl_key = "",
+                                              const std::string& ssl_cert = "", int max_receive_msg_size = 0,
+                                              int max_send_msg_size = 0);
 
     void run(const rpc_thread_start_cb_t& thread_start_cb = nullptr);
     void shutdown();
@@ -69,14 +72,14 @@ public:
             return false;
         }
 
-        auto svc = new typename ServiceT::AsyncService();
-        m_builder.RegisterService(svc);
-        m_services.insert({name, svc});
+        auto svc = std::make_unique< typename ServiceT::AsyncService >();
+        m_builder.RegisterService(svc.get());
+        m_services.insert({name, std::move(svc)});
 
         return true;
     }
 
-    template < typename ServiceT, typename ReqT, typename RespT, bool streaming = false >
+    template < typename ServiceT, typename ReqT, typename RespT >
     bool register_rpc(const std::string& name,
                       const sisl::request_call_cb_t< ServiceT, ReqT, RespT, false >& request_call_cb,
                       const sisl::rpc_handler_cb_t< ServiceT, ReqT, RespT, false >& rpc_handler,
@@ -89,7 +92,7 @@ public:
             return false;
         }
 
-        auto svc = static_cast< typename ServiceT::AsyncService* >(it->second);
+        auto svc = static_cast< typename ServiceT::AsyncService* >(it->second.get());
 
         size_t rpc_idx;
         {
@@ -109,7 +112,7 @@ public:
         return true;
     }
 
-    template < typename ServiceT, typename ReqT, typename RespT, bool streaming = false >
+    template < typename ServiceT, typename ReqT, typename RespT >
     bool register_sync_rpc(const std::string& name,
                            const sisl::request_call_cb_t< ServiceT, ReqT, RespT, false >& request_call_cb,
                            const sisl::rpc_sync_handler_cb_t< ReqT, RespT >& handler) {
@@ -139,10 +142,10 @@ private:
     ::grpc::ServerBuilder m_builder;
 
     std::unique_ptr< ::grpc::Server > m_server;
-    std::vector< std::shared_ptr< std::thread > > m_threads;
+    std::vector< std::unique_ptr< std::thread > > m_threads;
     std::vector< std::unique_ptr< ::grpc::ServerCompletionQueue > > m_cqs;
 
-    std::unordered_map< const char*, ::grpc::Service* > m_services;
+    std::unordered_map< std::string, std::unique_ptr< ::grpc::Service > > m_services;
     std::mutex m_rpc_registry_mtx;
     std::vector< std::unique_ptr< RpcStaticInfoBase > > m_rpc_registry;
     std::shared_ptr< sisl::GrpcTokenVerifier > m_auth_mgr;
