@@ -79,6 +79,34 @@ include_directories(BEFORE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+# stdexec's internal rapids-cmake/CPM uses FetchContent_Populate directly; suppress the CMP0169 warning
+if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+endif()
+
+include(FetchContent)
+FetchContent_Declare(
+    stdexec
+    GIT_REPOSITORY https://github.com/NVIDIA/stdexec.git
+    GIT_TAG        nvhpc-25.09
+    GIT_SHALLOW    TRUE
+)
+set(STDEXEC_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+set(STDEXEC_BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
+set(STDEXEC_ENABLE_CUDA      OFF CACHE BOOL "" FORCE)
+set(STDEXEC_ENABLE_TBB       OFF CACHE BOOL "" FORCE)
+set(STDEXEC_ENABLE_IO_URING  OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(stdexec)
+
+# GCC fires -Wempty-body on macro-generated else-clauses in stdexec's __tuple.hpp.
+# The header is transitively included by every TU that pulls in stdexec/execution.hpp,
+# so suppress on the INTERFACE target to propagate to all consumers, and on
+# system_context for the compiled translation unit.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(stdexec INTERFACE -Wno-empty-body)
+    target_compile_options(system_context PRIVATE -Wno-empty-body)
+endif()
+
 add_subdirectory(src)
 
 # build info

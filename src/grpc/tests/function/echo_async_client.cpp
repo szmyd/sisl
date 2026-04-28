@@ -12,29 +12,41 @@
  * specific language governing permissions and limitations under the License.
  *
  *********************************************************************************/
+#include <atomic>
 #include <memory>
-#include <string>
-#include <functional>
-#include <condition_variable>
-#include <chrono>
-#include <thread>
-#include <mutex>
 #include <random>
+#include <string>
+#include <thread>
+
+#include <exec/async_scope.hpp>
+#include <exec/static_thread_pool.hpp>
+#include <exec/task.hpp>
 
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
 
+#include "sisl/grpc/generic_service.hpp"
 #include "sisl/grpc/rpc_client.hpp"
 #include "sisl/grpc/rpc_server.hpp"
-#include "sisl/grpc/generic_service.hpp"
 #include "grpc_helper_test.grpc.pb.h"
 
 using namespace sisl;
 using namespace ::grpc_helper_test;
-using namespace std::placeholders;
 
-#define MAX_GRPC_RECV_SIZE 64 * 1024 * 1024
+#define MAX_GRPC_RECV_SIZE (64 * 1024 * 1024)
 
+#ifdef __SANITIZE_THREAD__
+static constexpr uint32_t k_rpc_deadline{30};
+#else
+// Original test serialized about half of the generic calls via blocking futures, limiting large-payload
+// concurrency to ~1 at a time. The coroutine version fires all calls concurrently, so we need more
+// headroom for the scheduler to work through the full 64 MB payload calls.
+static constexpr uint32_t k_rpc_deadline{10};
+#endif
+
+// ---------------------------------------------------------------------------
+// Helpers shared between client and server
+// ---------------------------------------------------------------------------
 static constexpr std::array< const char, 62 > alphanum{
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K',
     'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
@@ -45,143 +57,122 @@ static std::string gen_random_string(size_t len) {
     static thread_local std::random_device rd{};
     static thread_local std::default_random_engine re{rd()};
     std::uniform_int_distribution< size_t > rand_char{0, alphanum.size() - 1};
-    for (size_t i{0}; i < len; ++i) {
+    for (size_t i = 0; i < len; ++i) {
         str += alphanum[rand_char(re)];
     }
     str += '\0';
     return str;
 }
 
+// Payload used for all generic RPC calls — generated once, sub-stringed per call.
+static const std::string GENERIC_CLIENT_MESSAGE{gen_random_string(MAX_GRPC_RECV_SIZE)};
+static const std::string GENERIC_METHOD{"SendData"};
+
 struct DataMessage {
-    int m_seqno;
+    int m_seqno{0};
     std::string m_buf;
 
     DataMessage() = default;
-    DataMessage(const int n, const std::string& buf) : m_seqno{n}, m_buf{buf} {}
+    DataMessage(int n, const std::string& buf) : m_seqno{n}, m_buf{buf} {}
 
-    void SerializeToString(std::string& str_buf) const {
-        // first char denotes number of digits in seq_no
-        str_buf.append(std::to_string(numDigits(m_seqno)));
-        // append the seqno
-        str_buf.append(std::to_string(m_seqno));
-        // append the data buffer
-        str_buf.append(m_buf);
-    }
-    void DeserializeFromString(const std::string& str_buf) {
-        int num_dig = str_buf[0] - '0';
-        m_seqno = std::stoi(str_buf.substr(1, num_dig));
-        m_buf = str_buf.substr(1 + num_dig);
-    }
-
-    static int numDigits(int n) {
+    static int num_digits(int n) {
         int ret = 0;
         for (; n > 0; ret++) {
             n /= 10;
         }
         return ret;
     }
+
+    void serialize_to_string(std::string& out) const {
+        out.append(std::to_string(num_digits(m_seqno)));
+        out.append(std::to_string(m_seqno));
+        out.append(m_buf);
+    }
+
+    void deserialize_from_string(const std::string& s) {
+        int nd = s[0] - '0';
+        m_seqno = std::stoi(s.substr(1, nd));
+        m_buf = s.substr(1 + nd);
+    }
 };
 
-static void DeserializeFromBuffer(const grpc::ByteBuffer& buffer, DataMessage& msg) {
-    std::vector< grpc::Slice > slices;
-    (void)buffer.Dump(&slices);
-    std::string buf;
-    buf.reserve(buffer.Length());
-    for (auto s = slices.begin(); s != slices.end(); s++) {
-        buf.append(reinterpret_cast< const char* >(s->begin()), s->size());
-    }
-    msg.DeserializeFromString(buf);
-}
-
-static void DeserializeFromBuffer(sisl::io_blob const& buffer, DataMessage& msg) {
-    std::string buf;
-    buf.reserve(buffer.size());
-    buf.append(reinterpret_cast< const char* >(buffer.cbytes()), buffer.size());
-    msg.DeserializeFromString(buf);
-}
-
-static void SerializeToByteBuffer(grpc::ByteBuffer& buffer, const DataMessage& msg) {
-    std::string buf;
-    msg.SerializeToString(buf);
-    buffer.Clear();
-    grpc::Slice slice(buf);
+static void serialize_to_byte_buffer(grpc::ByteBuffer& buf, const DataMessage& msg) {
+    std::string s;
+    msg.serialize_to_string(s);
+    buf.Clear();
+    grpc::Slice slice(s);
     grpc::ByteBuffer tmp(&slice, 1);
-    buffer.Swap(&tmp);
+    buf.Swap(&tmp);
 }
 
-static void SerializeToBlob(sisl::io_blob_list_t& buffer, const DataMessage& msg) {
-    std::string str_msg;
-    msg.SerializeToString(str_msg);
-    auto buf = sisl::io_blob(str_msg.size());
-    std::memcpy(reinterpret_cast< void* >(buf.bytes()), reinterpret_cast< const void* >(str_msg.data()),
-                str_msg.size());
-    buffer.emplace_back(buf);
+static void deserialize_from_buffer(const grpc::ByteBuffer& buf, DataMessage& msg) {
+    std::vector< grpc::Slice > slices;
+    (void)buf.Dump(&slices);
+    std::string s;
+    s.reserve(buf.Length());
+    for (auto const& sl : slices) {
+        s.append(reinterpret_cast< const char* >(sl.begin()), sl.size());
+    }
+    msg.deserialize_from_string(s);
 }
 
-static const std::string GENERIC_CLIENT_MESSAGE{gen_random_string(MAX_GRPC_RECV_SIZE)};
-static const std::string GENERIC_METHOD{"SendData"};
+static void deserialize_from_blob(sisl::io_blob const& blob, DataMessage& msg) {
+    std::string s{reinterpret_cast< const char* >(blob.cbytes()), blob.size()};
+    msg.deserialize_from_string(s);
+}
 
-// TSAN adds ~20x overhead; 1 s is too tight for large (up to 64 MB) payloads.
-#ifdef __SANITIZE_THREAD__
-static constexpr uint32_t k_rpc_deadline{30};
-#else
-static constexpr uint32_t k_rpc_deadline{1};
-#endif
-
+// ---------------------------------------------------------------------------
+// TestClient
+// ---------------------------------------------------------------------------
 class TestClient {
 public:
     static constexpr int GRPC_CALL_COUNT = 400;
     const std::string WORKER_NAME{"Worker-1"};
 
-    void validate_echo_reply(const EchoRequest& req, EchoReply& reply, ::grpc::Status const& status) {
-        RELEASE_ASSERT_EQ(status.ok(), true, "echo request {} failed, status {}: {}", req.message(),
-                          status.error_code(), status.error_message());
-        LOGDEBUGMOD(grpc_server, "echo request {} reply {}", req.message(), reply.message());
-        RELEASE_ASSERT_EQ(req.message(), reply.message());
-        {
-            std::unique_lock lk(m_wait_mtx);
-            if (--m_echo_counter == 0) { m_cv.notify_all(); }
-        }
+    exec::task< void > do_echo(GrpcAsyncClient::AsyncStub< EchoService >* stub, int i) {
+        EchoRequest req;
+        req.set_message(std::to_string(i));
+        try {
+            auto reply =
+                co_await grpc_as_exception(stub->call(req, &EchoService::StubInterface::AsyncEcho, k_rpc_deadline));
+            LOGDEBUGMOD(grpc_server, "echo request {} reply {}", req.message(), reply.message());
+            RELEASE_ASSERT_EQ(req.message(), reply.message(), "echo reply mismatch for request {}", i);
+        } catch (const GrpcStatusException& e) { RELEASE_ASSERT(false, "echo request {} failed: {}", i, e.what()); }
     }
 
-    void validate_ping_reply(const PingRequest& req, PingReply& reply, ::grpc::Status const& status) {
-        RELEASE_ASSERT_EQ(status.ok(), true, "ping request {} failed, status {}: {}", req.seqno(), status.error_code(),
-                          status.error_message());
-        LOGDEBUGMOD(grpc_server, "ping request {} reply {}", req.seqno(), reply.seqno());
-        RELEASE_ASSERT_EQ(req.seqno(), reply.seqno());
-        {
-            std::unique_lock lk(m_wait_mtx);
-            if (--m_ping_counter == 0) { m_cv.notify_all(); }
-        }
+    exec::task< void > do_ping(GrpcAsyncClient::AsyncStub< PingService >* stub, int i) {
+        PingRequest req;
+        req.set_seqno(i);
+        try {
+            auto reply =
+                co_await grpc_as_exception(stub->call(req, &PingService::StubInterface::AsyncPing, k_rpc_deadline));
+            LOGDEBUGMOD(grpc_server, "ping request {} reply {}", req.seqno(), reply.seqno());
+            RELEASE_ASSERT_EQ(req.seqno(), reply.seqno(), "ping reply mismatch for request {}", i);
+        } catch (const GrpcStatusException& e) { RELEASE_ASSERT(false, "ping request {} failed: {}", i, e.what()); }
     }
 
-    void validate_generic_reply(const DataMessage& req, grpc::ByteBuffer& reply, ::grpc::Status const& status) {
-        RELEASE_ASSERT_EQ(status.ok(), true, "generic request {} failed, status {}: {}", req.m_seqno,
-                          status.error_code(), status.error_message());
-        DataMessage svr_msg;
-        DeserializeFromBuffer(reply, svr_msg);
-        RELEASE_ASSERT_EQ(req.m_seqno, svr_msg.m_seqno);
-        RELEASE_ASSERT_EQ(req.m_buf, svr_msg.m_buf);
-        {
-            std::unique_lock lk(m_wait_mtx);
-            if (--m_generic_counter == 0) { m_cv.notify_all(); }
-        }
-    }
+    exec::task< void > do_generic(GrpcAsyncClient::GenericAsyncStub* stub, int i) {
+        // Cycle through a range of payload sizes to stress gRPC framing paths.
+        static constexpr int mess_sizes[] = {16, 64, 64 * 1024, 16 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024 - 1024};
+        static thread_local std::mt19937 rng{std::random_device{}()};
+        static std::uniform_int_distribution< int > pick{0, (int)(std::size(mess_sizes)) - 1};
 
-    void validate_generic_reply(const DataMessage& req, sisl::GenericClientResponse reply, ::grpc::Status const& status,
-                                sisl::io_blob_list_t cli_buf) {
-        RELEASE_ASSERT_EQ(status.ok(), true, "generic request {} failed, status {}: {}", req.m_seqno,
-                          status.error_code(), status.error_message());
-        DataMessage svr_msg;
-        DeserializeFromBuffer(reply.response_blob(), svr_msg);
-        RELEASE_ASSERT_EQ(req.m_seqno, svr_msg.m_seqno);
-        RELEASE_ASSERT_EQ(req.m_buf, svr_msg.m_buf);
-        {
-            std::unique_lock lk(m_wait_mtx);
-            if (--m_generic_counter == 0) { m_cv.notify_all(); }
-        }
-        for (auto& buf : cli_buf) {
-            buf.buf_free();
+        int size = mess_sizes[pick(rng)];
+        DataMessage req{i, GENERIC_CLIENT_MESSAGE.substr(0, size)};
+        grpc::ByteBuffer cli_buf;
+        serialize_to_byte_buffer(cli_buf, req);
+
+        try {
+            auto reply_buf = co_await grpc_as_exception(stub->call(cli_buf, GENERIC_METHOD, k_rpc_deadline));
+            GenericClientResponse resp{reply_buf};
+            DataMessage svr_msg;
+            deserialize_from_blob(resp.response_blob(), svr_msg);
+            RELEASE_ASSERT_EQ(req.m_seqno, svr_msg.m_seqno, "generic seqno mismatch for request {}", i);
+            RELEASE_ASSERT_EQ(req.m_buf, svr_msg.m_buf, "generic data mismatch for request {}", i);
+        } catch (const GrpcStatusException& e) {
+            RELEASE_ASSERT(false, "generic request {} failed: {}", i, e.what());
+        } catch (const std::exception& e) {
+            RELEASE_ASSERT(false, "generic request {} deserialization error: {}", i, e.what());
         }
     }
 
@@ -194,157 +185,41 @@ public:
         auto ping_stub = client->make_stub< PingService >(WORKER_NAME);
         auto generic_stub = client->make_generic_stub(WORKER_NAME);
 
-        m_echo_counter = static_cast< int >(GRPC_CALL_COUNT / 2);
-        // all numbers divisible by 3 but not 2
-        m_ping_counter = static_cast< int >((GRPC_CALL_COUNT - 3) / 6) + 1;
-        m_generic_counter = GRPC_CALL_COUNT - m_echo_counter - m_ping_counter;
+        exec::static_thread_pool pool{4};
+        auto sched = pool.get_scheduler();
+        exec::async_scope scope;
 
         for (int i = 1; i <= GRPC_CALL_COUNT; ++i) {
             if ((i % 2) == 0) {
-                if ((i % 3) == 0) {
-                    EchoRequest req;
-                    req.set_message(std::to_string(i));
-                    echo_stub->call_unary< EchoRequest, EchoReply >(
-                        req, &EchoService::StubInterface::AsyncEcho,
-                        [req, this](EchoReply& reply, ::grpc::Status& status) {
-                            validate_echo_reply(req, reply, status);
-                        },
-                        k_rpc_deadline);
-                } else if (i % 3 == 1) {
-                    echo_stub->call_rpc< EchoRequest, EchoReply >(
-                        [i](EchoRequest& req) { req.set_message(std::to_string(i)); },
-                        &EchoService::StubInterface::AsyncEcho,
-                        [this](ClientRpcData< EchoRequest, EchoReply >& cd) {
-                            validate_echo_reply(cd.req(), cd.reply(), cd.status());
-                        },
-                        k_rpc_deadline);
-                } else {
-                    EchoRequest req;
-                    req.set_message(std::to_string(i));
-                    auto e = echo_stub
-                                 ->call_unary< EchoRequest, EchoReply >(req, &EchoService::StubInterface::AsyncEcho,
-                                                                        k_rpc_deadline)
-                                 .get();
-                    RELEASE_ASSERT(e.has_value(), "echo request {} failed, status {}: {}", req.message(),
-                                   e.error().error_code(), e.error().error_message());
-                    validate_echo_reply(req, e.value(), grpc::Status::OK);
-                }
+                scope.spawn(stdexec::starts_on(sched, do_echo(echo_stub.get(), i)));
             } else if ((i % 3) == 0) {
-                // divide all numbers divisible by 3 and not by 2 into three equal buckets
-                auto const j = (i + 3) / 6;
-                if (j % 3 == 0) {
-                    PingRequest req;
-                    req.set_seqno(i);
-                    ping_stub->call_unary< PingRequest, PingReply >(
-                        req, &PingService::StubInterface::AsyncPing,
-                        [req, this](PingReply& reply, ::grpc::Status& status) {
-                            validate_ping_reply(req, reply, status);
-                        },
-                        k_rpc_deadline);
-                } else if (j % 3 == 1) {
-                    ping_stub->call_rpc< PingRequest, PingReply >(
-                        [i](PingRequest& req) { req.set_seqno(i); }, &PingService::StubInterface::AsyncPing,
-                        [this](ClientRpcData< PingRequest, PingReply >& cd) {
-                            validate_ping_reply(cd.req(), cd.reply(), cd.status());
-                        },
-                        k_rpc_deadline);
-                } else {
-                    PingRequest req;
-                    req.set_seqno(i);
-                    auto e = ping_stub
-                                 ->call_unary< PingRequest, PingReply >(req, &PingService::StubInterface::AsyncPing,
-                                                                        k_rpc_deadline)
-                                 .get();
-                    RELEASE_ASSERT(e.has_value(), "ping request {} failed, status {}: {}", req.seqno(),
-                                   e.error().error_code(), e.error().error_message());
-                    validate_ping_reply(req, e.value(), grpc::Status::OK);
-                }
+                scope.spawn(stdexec::starts_on(sched, do_ping(ping_stub.get(), i)));
             } else {
-                // divide all numbers not divisible by 2 and 3 into three equal buckets
-                static uint32_t j = 0u;
-                static int mess_size[] = {16, 64, 64 * 1024, 16 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024 - 1024};
-                static std::random_device rd;
-                static std::mt19937 gen(rd());
-                static std::uniform_int_distribution< int > distrib(0, sizeof(mess_size) / sizeof(mess_size[0]) - 1);
-                if ((j++ % 4) == 0) {
-                    int size = mess_size[distrib(gen)];
-                    LOGDEBUGMOD(grpc_server, "Testing call_unary with size {}", size);
-                    DataMessage req(i, GENERIC_CLIENT_MESSAGE.substr(0, size));
-                    grpc::ByteBuffer cli_buf;
-                    SerializeToByteBuffer(cli_buf, req);
-                    generic_stub->call_unary(
-                        cli_buf, GENERIC_METHOD,
-                        [req, this](grpc::ByteBuffer& reply, ::grpc::Status& status) {
-                            validate_generic_reply(req, reply, status);
-                        },
-                        k_rpc_deadline);
-                } else if (((j++ % 4) == 1)) {
-                    int size = mess_size[distrib(gen)];
-                    LOGDEBUGMOD(grpc_server, "Testing call_rpc with size {}", size);
-                    DataMessage data_msg(i, GENERIC_CLIENT_MESSAGE.substr(0, size));
-                    generic_stub->call_rpc([data_msg](grpc::ByteBuffer& req) { SerializeToByteBuffer(req, data_msg); },
-                                           GENERIC_METHOD,
-                                           [data_msg, this](GenericClientRpcData& cd) {
-                                               validate_generic_reply(data_msg, cd.reply(), cd.status());
-                                           },
-                                           k_rpc_deadline);
-                } else if (((j++ % 4) == 2)) {
-                    int size = mess_size[distrib(gen)];
-                    LOGDEBUGMOD(grpc_server, "Testing call_unary with size {}", size);
-                    DataMessage req(i, GENERIC_CLIENT_MESSAGE.substr(0, size));
-                    grpc::ByteBuffer cli_buf;
-                    SerializeToByteBuffer(cli_buf, req);
-                    auto e = generic_stub->call_unary(cli_buf, GENERIC_METHOD, k_rpc_deadline).get();
-                    RELEASE_ASSERT(e.has_value(), "generic request {} failed, status {}: {}", req.m_seqno,
-                                   e.error().error_code(), e.error().error_message());
-                    validate_generic_reply(req, e.value(), grpc::Status::OK);
-
-                } else {
-                    int size = mess_size[distrib(gen)];
-                    LOGDEBUGMOD(grpc_server, "Testing call_unary with size {}", size);
-                    DataMessage req(i, GENERIC_CLIENT_MESSAGE.substr(0, size));
-                    sisl::io_blob_list_t cli_buf;
-                    SerializeToBlob(cli_buf, req);
-                    auto e = generic_stub->call_unary(cli_buf, GENERIC_METHOD, k_rpc_deadline).get();
-                    RELEASE_ASSERT(e.has_value(), "generic request {} failed, status {}: {}", req.m_seqno,
-                                   e.error().error_code(), e.error().error_message());
-                    validate_generic_reply(req, std::move(e.value()), grpc::Status::OK, cli_buf);
-                }
+                scope.spawn(stdexec::starts_on(sched, do_generic(generic_stub.get(), i)));
             }
         }
-    }
 
-    void wait() {
-        std::unique_lock lk(m_wait_mtx);
-        m_cv.wait(lk,
-                  [this]() { return ((m_echo_counter == 0) && (m_ping_counter == 0) && (m_generic_counter == 0)); });
+        stdexec::sync_wait(scope.on_empty());
         GrpcAsyncClientWorker::shutdown_all();
     }
-
-private:
-    int m_echo_counter;
-    int m_ping_counter;
-    int m_generic_counter;
-    std::mutex m_wait_mtx;
-    std::condition_variable m_cv;
 };
 
+// ---------------------------------------------------------------------------
+// TestServer
+// ---------------------------------------------------------------------------
 class TestServer {
 public:
     class EchoServiceImpl final {
-        std::atomic< uint32_t > num_calls = 0ul;
+        std::atomic< uint32_t > num_calls{0};
 
     public:
-        ~EchoServiceImpl() = default;
-
         void register_service(GrpcServer* server) {
-            auto const res = server->register_async_service< EchoService >();
-            RELEASE_ASSERT(res, "Failed to Register Service");
+            RELEASE_ASSERT(server->register_async_service< EchoService >(), "Failed to Register EchoService");
         }
 
         void register_rpcs(GrpcServer* server) {
-            LOGINFO("register rpc calls");
-            auto const res = server->register_rpc< EchoService, EchoRequest, EchoReply, false >(
+            LOGINFO("register echo rpc");
+            auto res = server->register_rpc< EchoService, EchoRequest, EchoReply, false >(
                 "Echo", &EchoService::AsyncService::RequestEcho,
                 [this](const AsyncRpcDataPtr< EchoService, EchoRequest, EchoReply >& rpc_data) {
                     if ((++num_calls % 2) == 0) {
@@ -359,24 +234,21 @@ public:
                     rpc_data->response().set_message(rpc_data->request().message());
                     return true;
                 });
-            RELEASE_ASSERT(res, "register rpc failed");
+            RELEASE_ASSERT(res, "register echo rpc failed");
         }
     };
 
     class PingServiceImpl final {
-        std::atomic< uint32_t > num_calls = 0ul;
+        std::atomic< uint32_t > num_calls{0};
 
     public:
-        ~PingServiceImpl() = default;
-
         void register_service(GrpcServer* server) {
-            auto const res = server->register_async_service< PingService >();
-            RELEASE_ASSERT(res, "Failed to Register Service");
+            RELEASE_ASSERT(server->register_async_service< PingService >(), "Failed to Register PingService");
         }
 
         void register_rpcs(GrpcServer* server) {
-            LOGINFO("register rpc calls");
-            auto const res = server->register_rpc< PingService, PingRequest, PingReply, false >(
+            LOGINFO("register ping rpc");
+            auto res = server->register_rpc< PingService, PingRequest, PingReply, false >(
                 "Ping", &PingService::AsyncService::RequestPing,
                 [this](const AsyncRpcDataPtr< PingService, PingRequest, PingReply >& rpc_data) {
                     if ((++num_calls % 2) == 0) {
@@ -396,49 +268,73 @@ public:
     };
 
     class GenericServiceImpl final {
-        std::atomic< uint32_t > num_calls = 0ul;
-        std::atomic< uint32_t > num_completions = 0ul;
+        std::atomic< uint32_t > num_calls{0};
+        std::atomic< uint32_t > num_completions{0};
 
-        template < typename BufT >
-        static void set_response(BufT const& req, grpc::ByteBuffer& resp, bool set_buf) {
-            DataMessage cli_request;
-            DeserializeFromBuffer(req, cli_request);
-            if (set_buf) { SerializeToByteBuffer(resp, cli_request); }
+        // send_response(io_blob_list_t) uses STATIC_SLICE — the caller must keep blob data alive
+        // until after the gRPC write completes (on_buf_write fires).  We stash the blob in the
+        // RPC context, which is destroyed in ~GenericRpcData() after on_request_completed.
+        struct BlobContext : public GenericRpcContextBase {
+            sisl::io_blob blob;
+            explicit BlobContext(sisl::io_blob b) : blob{b} {}
+            ~BlobContext() override { blob.buf_free(); }
+        };
+
+        // Fills rpc->response() with the echoed DataMessage.  Does NOT call send_response()
+        // so it works for both sync (infrastructure sends) and async (thread sends) paths.
+        static void prepare_byte_buffer_response(const boost::intrusive_ptr< GenericRpcData >& rpc) {
+            DataMessage msg;
+            deserialize_from_buffer(rpc->request(), msg);
+            serialize_to_byte_buffer(rpc->response(), msg);
+        }
+
+        // Exercises send_response(io_blob_list_t).  Always calls send_response() itself
+        // so it is only called from the async thread path.
+        static void echo_via_io_blob(const boost::intrusive_ptr< GenericRpcData >& rpc) {
+            DataMessage msg;
+            deserialize_from_buffer(rpc->request(), msg);
+            std::string s;
+            msg.serialize_to_string(s);
+            sisl::io_blob blob{static_cast< uint32_t >(s.size()), 0};
+            std::memcpy(blob.bytes(), s.data(), s.size());
+            // Keep blob alive until after the write completes (context freed in ~GenericRpcData).
+            rpc->set_context(std::make_unique< BlobContext >(blob));
+            rpc->send_response(io_blob_list_t{blob});
         }
 
     public:
         void register_service(GrpcServer* server) {
-            auto const res = server->register_async_generic_service();
-            RELEASE_ASSERT(res, "Failed to Register Service");
+            RELEASE_ASSERT(server->register_async_generic_service(), "Failed to Register GenericService");
         }
 
         void register_rpcs(GrpcServer* server) {
-            LOGINFO("register rpc calls");
-            auto const res =
+            LOGINFO("register generic rpc");
+            auto res =
                 server->register_generic_rpc(GENERIC_METHOD, [this](boost::intrusive_ptr< GenericRpcData >& rpc_data) {
-                    rpc_data->set_comp_cb([this](boost::intrusive_ptr< GenericRpcData >&) { num_completions++; });
-                    if ((++num_calls % 2) == 0) {
-                        LOGDEBUGMOD(grpc_server, "respond async generic request, call_num {}", num_calls.load());
-                        std::thread([this, rpc = rpc_data] {
-                            if ((num_calls % 3) == 0) {
-                                set_response(rpc->request_blob(), rpc->response(), false);
-                                rpc->send_response(io_blob_list_t{rpc->request_blob()});
+                    rpc_data->set_comp_cb([this](boost::intrusive_ptr< GenericRpcData >&) { ++num_completions; });
+                    auto call_n = ++num_calls;
+                    if ((call_n % 2) == 0) {
+                        LOGDEBUGMOD(grpc_server, "respond async generic request, call_num {}", call_n);
+                        std::thread([call_n, rpc = rpc_data] {
+                            if ((call_n % 3) == 0) {
+                                echo_via_io_blob(rpc);
                             } else {
-                                set_response(rpc->request_blob(), rpc->response(), true);
+                                prepare_byte_buffer_response(rpc);
                                 rpc->send_response();
                             }
                         }).detach();
                         return false;
                     }
-                    set_response(rpc_data->request(), rpc_data->response(), true);
+                    // Sync path: prepare response, return true so infrastructure calls send_response().
+                    prepare_byte_buffer_response(rpc_data);
                     return true;
                 });
             RELEASE_ASSERT(res, "register generic rpc failed");
         }
 
-        bool compare_counters() {
+        bool check_counters() const {
             if (num_calls != num_completions) {
-                LOGERROR("num calls: {}, num_completions = {}", num_calls.load(), num_completions.load());
+                LOGERROR("num_calls={} num_completions={} — mismatch", num_calls.load(), num_completions.load());
                 return false;
             }
             return true;
@@ -446,41 +342,31 @@ public:
     };
 
     void start(const std::string& server_address) {
-        LOGINFO("Start echo and ping server on {}...", server_address);
+        LOGINFO("Starting echo/ping/generic server on {}", server_address);
         m_grpc_server = GrpcServer::make(server_address, 4, "", "", MAX_GRPC_RECV_SIZE);
-        m_echo_impl = new EchoServiceImpl();
-        m_echo_impl->register_service(m_grpc_server);
-
-        m_ping_impl = new PingServiceImpl();
-        m_ping_impl->register_service(m_grpc_server);
-
-        m_generic_impl = new GenericServiceImpl();
-        m_generic_impl->register_service(m_grpc_server);
-
+        m_echo_impl.register_service(m_grpc_server);
+        m_ping_impl.register_service(m_grpc_server);
+        m_generic_impl.register_service(m_grpc_server);
         m_grpc_server->run();
+        m_echo_impl.register_rpcs(m_grpc_server);
+        m_ping_impl.register_rpcs(m_grpc_server);
+        m_generic_impl.register_rpcs(m_grpc_server);
         LOGINFO("Server listening on {}", server_address);
-
-        m_echo_impl->register_rpcs(m_grpc_server);
-        m_ping_impl->register_rpcs(m_grpc_server);
-        m_generic_impl->register_rpcs(m_grpc_server);
     }
 
     void shutdown() {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        RELEASE_ASSERT(m_generic_impl->compare_counters(), "num calls and num completions do not match!");
+        RELEASE_ASSERT(m_generic_impl.check_counters(), "generic RPC call/completion counter mismatch");
         LOGINFO("Shutting down grpc server");
         m_grpc_server->shutdown();
         delete m_grpc_server;
-        delete m_echo_impl;
-        delete m_ping_impl;
-        delete m_generic_impl;
     }
 
 private:
-    GrpcServer* m_grpc_server = nullptr;
-    EchoServiceImpl* m_echo_impl = nullptr;
-    PingServiceImpl* m_ping_impl = nullptr;
-    GenericServiceImpl* m_generic_impl = nullptr;
+    GrpcServer* m_grpc_server{nullptr};
+    EchoServiceImpl m_echo_impl;
+    PingServiceImpl m_ping_impl;
+    GenericServiceImpl m_generic_impl;
 };
 
 SISL_LOGGING_INIT(logging, grpc_server)
@@ -491,12 +377,11 @@ int main(int argc, char** argv) {
     sisl::logging::SetLogger("async_client");
 
     TestServer server;
-    std::string server_address("0.0.0.0:50052");
+    const std::string server_address{"0.0.0.0:50052"};
     server.start(server_address);
 
     TestClient client;
     client.run(server_address);
-    client.wait();
 
     server.shutdown();
     return 0;

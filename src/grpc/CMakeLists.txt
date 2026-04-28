@@ -11,6 +11,7 @@ target_sources(sisl_grpc PRIVATE
 target_link_libraries(sisl_grpc PUBLIC
   sisl_buffer
   gRPC::grpc++
+  STDEXEC::stdexec
   )
 
 add_subdirectory(tests)

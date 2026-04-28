@@ -14,31 +14,30 @@
  *********************************************************************************/
 #pragma once
 
-#include <memory>
-#include <string>
 #include <chrono>
-#include <thread>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <span>
+#include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include <boost/core/noncopyable.hpp>
+#include <fmt/format.h>
+#include <grpc/support/log.h>
+#include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/impl/codegen/async_unary_call.h>
-#include <grpcpp/generic/generic_stub.h>
-#include <grpc/support/log.h>
+#include <stdexec/execution.hpp>
 
-#include <expected>
-#include <future>
-#include <span>
-
-#include <sisl/logging/logging.h>
-#include <sisl/utility/obj_life_counter.hpp>
-#include <sisl/utility/enum.hpp>
 #include <sisl/auth_manager/token_client.hpp>
 #include <sisl/fds/buffer.hpp>
-
-#include <fmt/format.h>
+#include <sisl/logging/logging.h>
+#include <sisl/utility/enum.hpp>
+#include <sisl/utility/obj_life_counter.hpp>
 
 namespace grpc {
 inline auto format_as(StatusCode s) { return fmt::underlying(s); }
@@ -46,183 +45,219 @@ inline auto format_as(StatusCode s) { return fmt::underlying(s); }
 
 namespace sisl {
 
-/**
- * A interface for handling gRPC async response
- */
-class ClientRpcDataAbstract : private boost::noncopyable {
-public:
-    virtual ~ClientRpcDataAbstract() = default;
-    virtual void handle_response(bool ok = true) = 0;
+// ---------------------------------------------------------------------------
+// GrpcCqTag — base for all CompletionQueue tags
+//
+// The void* registered with grpc::CompletionQueue::Finish() is always a
+// GrpcCqTag*.  The drain loop in GrpcAsyncClientWorker dispatches through
+// this vtable, then leaves lifetime management to the concrete subclass.
+// ---------------------------------------------------------------------------
+struct GrpcCqTag {
+    virtual ~GrpcCqTag() = default;
+    virtual void on_complete(bool ok) noexcept = 0;
 };
 
-template < typename ReqT, typename RespT >
-class ClientRpcData;
-
-template < typename ReqT, typename RespT >
-using rpc_comp_cb_t = std::function< void(ClientRpcData< ReqT, RespT >& cd) >;
-
-template < typename ReqT >
-using req_builder_cb_t = std::function< void(ReqT&) >;
-
-template < typename RespT >
-using unary_callback_t = std::function< void(RespT&, ::grpc::Status& status) >;
-
-template < typename ReqT, typename RespT >
-class ClientRpcDataCallback;
-
-template < typename ReqT, typename RespT >
-class ClientRpcDataFuture;
-
-template < typename T >
-using GrpcResult = std::expected< T, ::grpc::Status >;
-
-template < typename T >
-using GrpcAsyncResult = std::future< GrpcResult< T > >;
-
-using GenericClientRpcData = ClientRpcData< grpc::ByteBuffer, grpc::ByteBuffer >;
-using generic_rpc_comp_cb_t = rpc_comp_cb_t< grpc::ByteBuffer, grpc::ByteBuffer >;
-using generic_req_builder_cb_t = req_builder_cb_t< grpc::ByteBuffer >;
-using generic_unary_callback_t = unary_callback_t< grpc::ByteBuffer >;
-using GenericClientRpcDataCallback = ClientRpcDataCallback< grpc::ByteBuffer, grpc::ByteBuffer >;
-using GenericClientRpcDataFuture = ClientRpcDataFuture< grpc::ByteBuffer, grpc::ByteBuffer >;
-
-/**
- * The specialized 'ClientRpcDataInternal' per gRPC call,
- * Derive from this class to create Rpc Data that can hold
- * the response handler function or a promise
- */
-template < typename ReqT, typename RespT >
-class ClientRpcDataInternal : public ClientRpcDataAbstract {
-public:
-    using ResponseReaderPtr = std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< RespT > >;
-    using GenericResponseReaderPtr = std::unique_ptr< grpc::GenericClientAsyncResponseReader >;
-
-    /* Allow GrpcAsyncClient and its inner classes to use
-     * ClientCallData.
-     */
-    friend class GrpcAsyncClient;
-
-    ClientRpcDataInternal() = default;
-    ~ClientRpcDataInternal() override = default;
-
-    // TODO: support time in any time unit -- lhuang8
-    void set_deadline(uint32_t seconds) {
-        std::chrono::system_clock::time_point deadline =
-            std::chrono::system_clock::now() + std::chrono::seconds(seconds);
-        m_context.set_deadline(deadline);
-    }
-
-    ResponseReaderPtr& responder_reader() { return m_resp_reader_ptr; }
-    ::grpc::Status& status() { return m_status; }
-    RespT& reply() { return m_reply; }
-    ::grpc::ClientContext& context() { return m_context; }
-
-    void handle_response(bool ok = true) override = 0;
-
-    void add_metadata(const std::string& meta_key, const std::string& meta_value) {
-        m_context.AddMetadata(meta_key, meta_value);
-    }
-
-    RespT m_reply;
-    ::grpc::ClientContext m_context;
+// ---------------------------------------------------------------------------
+// GrpcStatusException — carries a grpc::Status as a std::exception.
+//
+// Use grpc_as_exception() to adapt a GrpcUnarySender for co_await inside
+// exec::task<>, which requires std::exception_ptr on its error channel.
+// ---------------------------------------------------------------------------
+struct GrpcStatusException : public std::exception {
+    explicit GrpcStatusException(::grpc::Status s) noexcept : m_status{std::move(s)}, m_msg{m_status.error_message()} {}
+    const char* what() const noexcept override { return m_msg.c_str(); }
     ::grpc::Status m_status;
-    ResponseReaderPtr m_resp_reader_ptr;
-    GenericResponseReaderPtr m_generic_resp_reader_ptr;
+    std::string m_msg;
 };
 
-/**
- * callback version of ClientRpcDataInternal
- */
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
 template < typename ReqT, typename RespT >
-class ClientRpcDataCallback : public ClientRpcDataInternal< ReqT, RespT > {
-public:
-    ClientRpcDataCallback(const unary_callback_t< RespT >& cb) : m_cb{cb} {}
+class GrpcUnarySender;
 
-    void handle_response([[maybe_unused]] bool ok = true) override {
-        // For unary call, ok is always true, `status_` will indicate error if there are any.
-        if (m_cb) { m_cb(this->m_reply, this->m_status); }
+template < typename ReqT, typename RespT, typename Receiver >
+class GrpcUnaryOpState;
+
+// ---------------------------------------------------------------------------
+// GrpcUnarySender<ReqT, RespT>
+//
+// A P2300 sender representing a single in-flight gRPC unary call.
+// Completion signatures:
+//   set_value_t(RespT)        — RPC succeeded
+//   set_error_t(grpc::Status) — RPC failed
+//   set_stopped_t()           — stop was requested before or during the call
+//
+// Obtain one via AsyncStub<ServiceT>::call().
+// ---------------------------------------------------------------------------
+template < typename ReqT, typename RespT >
+class GrpcUnarySender {
+public:
+    using sender_concept = stdexec::sender_t;
+    using completion_signatures =
+        stdexec::completion_signatures< stdexec::set_value_t(RespT), stdexec::set_error_t(::grpc::Status),
+                                        stdexec::set_stopped_t() >;
+
+    using ResponseReader = ::grpc::ClientAsyncResponseReaderInterface< RespT >;
+    // Abstracts the typed stub + method-pointer so the sender carries only two template params.
+    using StartFn = std::function< std::unique_ptr< ResponseReader >(::grpc::ClientContext*, const ReqT&,
+                                                                     ::grpc::CompletionQueue*) >;
+
+    GrpcUnarySender(ReqT req, StartFn fn, uint32_t deadline,
+                    std::vector< std::pair< std::string, std::string > > metadata, ::grpc::CompletionQueue* cq,
+                    std::shared_ptr< sisl::GrpcTokenClient > token_client) :
+            m_req{std::move(req)},
+            m_start_fn{std::move(fn)},
+            m_deadline{deadline},
+            m_metadata{std::move(metadata)},
+            m_cq{cq},
+            m_token_client{std::move(token_client)} {}
+
+    template < stdexec::receiver_of< completion_signatures > Receiver >
+    auto connect(Receiver rcvr) && -> GrpcUnaryOpState< ReqT, RespT, Receiver >;
+
+private:
+    ReqT m_req;
+    StartFn m_start_fn;
+    uint32_t m_deadline;
+    std::vector< std::pair< std::string, std::string > > m_metadata;
+    ::grpc::CompletionQueue* m_cq;
+    std::shared_ptr< sisl::GrpcTokenClient > m_token_client;
+
+    template < typename, typename, typename >
+    friend class GrpcUnaryOpState;
+};
+
+// ---------------------------------------------------------------------------
+// GrpcUnaryOpState<ReqT, RespT, Receiver>
+//
+// The operation_state produced by GrpcUnarySender::connect().  Its address is
+// passed to grpc::Finish() as the void* CQ tag and MUST remain stable after
+// start() is called — it is therefore non-copyable and non-movable.
+// ---------------------------------------------------------------------------
+template < typename ReqT, typename RespT, typename Receiver >
+class GrpcUnaryOpState : public GrpcCqTag {
+public:
+    using operation_state_concept = stdexec::operation_state_t;
+
+    explicit GrpcUnaryOpState(GrpcUnarySender< ReqT, RespT >&& s, Receiver rcvr) :
+            m_req{std::move(s.m_req)},
+            m_start_fn{std::move(s.m_start_fn)},
+            m_deadline{s.m_deadline},
+            m_metadata{std::move(s.m_metadata)},
+            m_cq{s.m_cq},
+            m_token_client{std::move(s.m_token_client)},
+            m_receiver{std::move(rcvr)} {}
+
+    GrpcUnaryOpState(const GrpcUnaryOpState&) = delete;
+    GrpcUnaryOpState(GrpcUnaryOpState&&) = delete;
+    GrpcUnaryOpState& operator=(const GrpcUnaryOpState&) = delete;
+    GrpcUnaryOpState& operator=(GrpcUnaryOpState&&) = delete;
+
+    void start() & noexcept {
+        if (stdexec::get_stop_token(stdexec::get_env(m_receiver)).stop_requested()) {
+            stdexec::set_stopped(std::move(m_receiver));
+            return;
+        }
+        m_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(m_deadline));
+        for (auto const& [k, v] : m_metadata) {
+            m_context.AddMetadata(k, v);
+        }
+        if (m_token_client) {
+            m_context.AddMetadata(m_token_client->get_auth_header_key(), m_token_client->get_token());
+        }
+        m_reader = m_start_fn(&m_context, m_req, m_cq);
+        m_reader->Finish(&m_reply, &m_status, static_cast< GrpcCqTag* >(this));
     }
 
-    unary_callback_t< RespT > m_cb;
-};
-
-/**
- * futures version of ClientRpcDataInternal
- */
-template < typename ReqT, typename RespT >
-class ClientRpcDataFuture : public ClientRpcDataInternal< ReqT, RespT > {
-public:
-    ClientRpcDataFuture(std::promise< GrpcResult< RespT > >&& promise) : m_promise{std::move(promise)} {}
-
-    void handle_response([[maybe_unused]] bool ok = true) override {
-        // For unary call, ok is always true, `status_` will indicate error if there are any.
-        if (this->m_status.ok()) {
-            m_promise.set_value(this->m_reply);
+    // Called from the GrpcAsyncClientWorker drain thread when the CQ event fires.
+    void on_complete([[maybe_unused]] bool ok) noexcept override {
+        if (stdexec::get_stop_token(stdexec::get_env(m_receiver)).stop_requested()) {
+            stdexec::set_stopped(std::move(m_receiver));
+        } else if (!m_status.ok()) {
+            stdexec::set_error(std::move(m_receiver), std::move(m_status));
         } else {
-            m_promise.set_value(std::unexpected(this->m_status));
+            stdexec::set_value(std::move(m_receiver), std::move(m_reply));
         }
     }
 
-    std::promise< GrpcResult< RespT > > m_promise;
+private:
+    // Declaration order must match the constructor initializer list to satisfy -Wreorder.
+    ReqT m_req;
+    typename GrpcUnarySender< ReqT, RespT >::StartFn m_start_fn;
+    uint32_t m_deadline;
+    std::vector< std::pair< std::string, std::string > > m_metadata;
+    ::grpc::CompletionQueue* m_cq;
+    std::shared_ptr< sisl::GrpcTokenClient > m_token_client;
+    Receiver m_receiver;
+    // Default-constructed; not in the initializer list.
+    RespT m_reply{};
+    ::grpc::ClientContext m_context;
+    ::grpc::Status m_status;
+    std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< RespT > > m_reader;
 };
 
-class GenericClientResponse : public ObjLifeCounter< GenericClientResponse > {
+// connect() is defined here (after GrpcUnaryOpState is complete) to satisfy the forward decl above.
+template < typename ReqT, typename RespT >
+template < stdexec::receiver_of< typename GrpcUnarySender< ReqT, RespT >::completion_signatures > Receiver >
+auto GrpcUnarySender< ReqT, RespT >::connect(Receiver rcvr) && -> GrpcUnaryOpState< ReqT, RespT, Receiver > {
+    return GrpcUnaryOpState< ReqT, RespT, Receiver >{std::move(*this), std::move(rcvr)};
+}
+
+// ---------------------------------------------------------------------------
+// grpc_as_exception(sender)
+//
+// Adapts a GrpcUnarySender for co_await inside exec::task<>.
+// Converts set_error(grpc::Status) → set_error(exception_ptr) so the task's
+// try/catch machinery can handle gRPC failures uniformly.
+// ---------------------------------------------------------------------------
+template < typename Sender >
+auto grpc_as_exception(Sender&& s) {
+    return std::forward< Sender >(s) | stdexec::let_error([](::grpc::Status status) noexcept {
+               return stdexec::just_error(std::make_exception_ptr(GrpcStatusException{std::move(status)}));
+           });
+}
+
+// ---------------------------------------------------------------------------
+// GenericClientResponse — ByteBuffer response as a contiguous sisl::io_blob.
+//
+// Converts a grpc::ByteBuffer (possibly multi-slice) into a single allocation.
+// Uses shared ownership so copies are cheap; both original and copy refer to
+// the same underlying buffer.
+// ---------------------------------------------------------------------------
+class GenericClientResponse {
 public:
     GenericClientResponse() = default;
-    GenericClientResponse(grpc::ByteBuffer const& buf) : m_response_buf{buf} {}
 
-    GenericClientResponse(GenericClientResponse&& other);
-    GenericClientResponse& operator=(GenericClientResponse&& other);
-    GenericClientResponse(GenericClientResponse const& other) = default;
-    GenericClientResponse& operator=(GenericClientResponse const& other);
-    ~GenericClientResponse() = default;
-
-    io_blob response_blob();
-
-private:
-    grpc::ByteBuffer m_response_buf;
-    grpc::Slice m_single_slice;
-};
-
-/**
- * futures version of ClientRpcDataInternal
- * This class holds the promise end of the grpc response
- * that returns a GenericClientResponse. The sisl::io_blob version of the response
- * can be accessed via the response_blob() method.
- */
-class GenericRpcDataFutureBlob : public ClientRpcDataInternal< grpc::ByteBuffer, grpc::ByteBuffer > {
-public:
-    GenericRpcDataFutureBlob(std::promise< GrpcResult< GenericClientResponse > >&& promise);
-    void handle_response([[maybe_unused]] bool ok = true) override;
-
-private:
-    std::promise< GrpcResult< GenericClientResponse > > m_promise;
-};
-
-template < typename ReqT, typename RespT >
-class ClientRpcData : public ClientRpcDataInternal< ReqT, RespT > {
-public:
-    ClientRpcData(const rpc_comp_cb_t< ReqT, RespT >& comp_cb) : m_comp_cb{comp_cb} {}
-    ~ClientRpcData() override = default;
-
-    void handle_response([[maybe_unused]] bool ok = true) override {
-        // For unary call, ok is always true, `status_` will indicate error if there are any.
-        m_comp_cb(*this);
-        // Caller could delete this pointer and thus don't acccess anything after this.
+    explicit GenericClientResponse(const ::grpc::ByteBuffer& buf) {
+        std::vector< ::grpc::Slice > slices;
+        (void)buf.Dump(&slices);
+        size_t total = 0;
+        for (auto const& s : slices) {
+            total += s.size();
+        }
+        if (total > 0) {
+            m_buf = sisl::make_byte_array(static_cast< uint32_t >(total), 0);
+            uint8_t* dst = m_buf->bytes();
+            for (auto const& s : slices) {
+                std::memcpy(dst, s.begin(), s.size());
+                dst += s.size();
+            }
+        }
     }
 
-    const ReqT& req() { return m_req; }
+    sisl::io_blob response_blob() const {
+        if (!m_buf) { return sisl::io_blob{}; }
+        return sisl::io_blob{m_buf->cbytes(), m_buf->size(), m_buf->is_aligned()};
+    }
 
-    rpc_comp_cb_t< ReqT, RespT > m_comp_cb;
-    ReqT m_req;
+private:
+    sisl::byte_array m_buf;
 };
 
-/**
- * A GrpcBaseClient takes care of establish a channel to grpc
- * server. The channel can be used by any number of grpc
- * generated stubs.
- *
- */
+// ---------------------------------------------------------------------------
+// GrpcBaseClient — manages the channel and SSL/token state
+// ---------------------------------------------------------------------------
 class GrpcBaseClient {
 protected:
     const std::string m_server_addr;
@@ -261,16 +296,14 @@ public:
 
 ENUM(ClientState, uint8_t, VOID, INIT, RUNNING, SHUTTING_DOWN, TERMINATED)
 
-/**
- * One GrpcBaseClient can have multiple stub
- *
- * The gRPC client worker, it owns a CompletionQueue and one or more threads,
- * it's only used for handling asynchronous responses.
- *
- * The CompletionQueue is used to send asynchronous request, then the
- * response will be handled on worker threads.
- *
- */
+// ---------------------------------------------------------------------------
+// GrpcAsyncClientWorker
+//
+// Owns a grpc::CompletionQueue and N drain threads.  All GrpcUnarySender
+// operations submitted through stubs created from the same worker share
+// this CQ.  The drain loop dispatches via GrpcCqTag::on_complete(); it does
+// NOT delete the tag — that is the operation_state's responsibility.
+// ---------------------------------------------------------------------------
 class GrpcAsyncClientWorker final {
 public:
     using UPtr = std::unique_ptr< GrpcAsyncClientWorker >;
@@ -284,23 +317,12 @@ public:
 
     static void create_worker(const std::string& name, int num_threads);
     static GrpcAsyncClientWorker* get_worker(const std::string& name);
-
-    /**
-     * Must be called explicitly before program exit if any worker created.
-     */
     static void shutdown_all();
 
 private:
-    /*
-     * Shutdown CompletionQueue and threads.
-     *
-     * For now, workers can only by shutdown by
-     * GrpcAsyncClientWorker::shutdown_all().
-     */
     void shutdown();
     void client_loop();
 
-private:
     static std::mutex s_workers_mtx;
     static std::unordered_map< std::string, GrpcAsyncClientWorker::UPtr > s_workers;
 
@@ -309,9 +331,11 @@ private:
     std::vector< std::thread > m_threads;
 };
 
-// common request id header
 inline constexpr std::string_view request_id_header{"request_id"};
 
+// ---------------------------------------------------------------------------
+// GrpcAsyncClient — creates typed stubs backed by a GrpcAsyncClientWorker
+// ---------------------------------------------------------------------------
 class GrpcAsyncClient : public GrpcBaseClient {
 public:
     template < typename ServiceT >
@@ -329,27 +353,17 @@ public:
 
     ~GrpcAsyncClient() override = default;
 
-    /**
-     * AsyncStub is a wrapper of generated service stub.
-     *
-     * An AsyncStub is created with a GrpcAsyncClientWorker, all responses
-     * of grpc async calls made on it will be handled on the
-     * GrpcAsyncClientWorker's threads.
-     *
-     * Please use GrpcAsyncClient::make_stub() to create AsyncStub.
-     *
-     */
+    // -----------------------------------------------------------------------
+    // AsyncStub<ServiceT>
+    //
+    // Wraps a generated gRPC stub and a worker.  Use call() to obtain a
+    // GrpcUnarySender for each unary RPC.
+    // -----------------------------------------------------------------------
     template < typename ServiceT >
     struct AsyncStub {
         using UPtr = std::unique_ptr< AsyncStub >;
-
-        AsyncStub(StubPtr< ServiceT > stub, GrpcAsyncClientWorker* worker,
-                  std::shared_ptr< sisl::GrpcTokenClient > token_client) :
-                m_stub(std::move(stub)), m_worker(worker), m_token_client(token_client) {}
-
         using stub_t = typename ServiceT::StubInterface;
 
-        /* unary call helper */
         template < typename RespT >
         using unary_call_return_t = std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< RespT > >;
 
@@ -357,130 +371,72 @@ public:
         using unary_call_t = unary_call_return_t< RespT > (stub_t::*)(::grpc::ClientContext*, const ReqT&,
                                                                       ::grpc::CompletionQueue*);
 
+        AsyncStub(StubPtr< ServiceT > stub, GrpcAsyncClientWorker* worker,
+                  std::shared_ptr< sisl::GrpcTokenClient > token_client) :
+                m_stub{std::move(stub)}, m_worker{worker}, m_token_client{std::move(token_client)} {}
+
+        // Returns a sender that, when started, performs the gRPC unary call and
+        // delivers the response through the stdexec completion protocol.
         template < typename ReqT, typename RespT >
-        void prepare_and_send_unary(ClientRpcDataInternal< ReqT, RespT >* data, const ReqT& request,
-                                    const unary_call_t< ReqT, RespT >& method, uint32_t deadline,
-                                    std::span< const std::pair< std::string, std::string > > metadata) {
-            data->set_deadline(deadline);
-            for (auto const& [key, value] : metadata) {
-                data->add_metadata(key, value);
-            }
-            if (m_token_client) {
-                data->add_metadata(m_token_client->get_auth_header_key(), m_token_client->get_token());
-            }
-            // Note that async unary RPCs don't post a CQ tag in call
-            data->m_resp_reader_ptr = (m_stub.get()->*method)(&data->m_context, request, cq());
-            // CQ tag posted here
-            data->m_resp_reader_ptr->Finish(&data->reply(), &data->status(), (void*)data);
+        auto call(const ReqT& request, const unary_call_t< ReqT, RespT >& method, uint32_t deadline,
+                  std::span< const std::pair< std::string, std::string > > metadata = {})
+            -> GrpcUnarySender< ReqT, RespT > {
+            typename GrpcUnarySender< ReqT, RespT >::StartFn fn = [stub = m_stub.get(),
+                                                                   method](::grpc::ClientContext* ctx, const ReqT& req,
+                                                                           ::grpc::CompletionQueue* cq_ptr) {
+                return (stub->*method)(ctx, req, cq_ptr);
+            };
+            return GrpcUnarySender< ReqT, RespT >{request, std::move(fn), deadline, {metadata.begin(), metadata.end()},
+                                                  cq(),    m_token_client};
         }
 
-        // using unary_callback_t = std::function< void(RespT&, ::grpc::Status& status) >;
-
-        /**
-         * Make a unary call.
-         *
-         * @param request - a request of this unary call.
-         * @param call - a pointer to a member function in grpc service stub
-         *     which used to make an aync call. If service name is
-         *     "EchoService" and an unary rpc is defined as:
-         *     `    rpc Echo (EchoRequest) returns (EchoReply) {}`
-         *     then the member function used here should be:
-         *     `EchoService::StubInterface::AsyncEcho`.
-         * @param callback - the response handler function, which will be
-         *     called after response received asynchronously or call failed(which
-         *     would happen if the channel is either permanently broken or
-         *     transiently broken, or call timeout).
-         *     The callback function must check if `::grpc::Status` argument is
-         *     OK before handling the response. If call failed, `::grpc::Status`
-         *     indicates the error code and error message.
-         * @param deadline - deadline in seconds
-         * @param metadata - key value pair of the metadata to be sent with the request
-         *
-         */
-        template < typename ReqT, typename RespT >
-        void call_unary(const ReqT& request, const unary_call_t< ReqT, RespT >& method,
-                        const unary_callback_t< RespT >& callback, uint32_t deadline,
-                        std::span< const std::pair< std::string, std::string > > metadata) {
-            auto data = new ClientRpcDataCallback< ReqT, RespT >(callback);
-            prepare_and_send_unary(data, request, method, deadline, metadata);
-        }
-
-        template < typename ReqT, typename RespT >
-        void call_unary(const ReqT& request, const unary_call_t< ReqT, RespT >& method,
-                        const unary_callback_t< RespT >& callback, uint32_t deadline) {
-            call_unary(request, method, callback, deadline, {});
-        }
-
-        template < typename ReqT, typename RespT >
-        void call_rpc(const req_builder_cb_t< ReqT >& builder_cb, const unary_call_t< ReqT, RespT >& method,
-                      const rpc_comp_cb_t< ReqT, RespT >& done_cb, uint32_t deadline) {
-            auto cd = new ClientRpcData< ReqT, RespT >(done_cb);
-            builder_cb(cd->m_req);
-            prepare_and_send_unary(cd, cd->m_req, method, deadline, {});
-        }
-
-        // Futures version of call_unary
-        template < typename ReqT, typename RespT >
-        GrpcAsyncResult< RespT > call_unary(const ReqT& request, const unary_call_t< ReqT, RespT >& method,
-                                            uint32_t deadline,
-                                            std::span< const std::pair< std::string, std::string > > metadata) {
-            std::promise< GrpcResult< RespT > > p;
-            auto sf = p.get_future();
-            auto data = new ClientRpcDataFuture< ReqT, RespT >(std::move(p));
-            prepare_and_send_unary(data, request, method, deadline, metadata);
-            return sf;
-        }
-
-        template < typename ReqT, typename RespT >
-        GrpcAsyncResult< RespT > call_unary(const ReqT& request, const unary_call_t< ReqT, RespT >& method,
-                                            uint32_t deadline) {
-            return call_unary(request, method, deadline, {});
-        }
+        const StubPtr< ServiceT >& stub() { return m_stub; }
+        ::grpc::CompletionQueue* cq() { return &m_worker->cq(); }
 
         StubPtr< ServiceT > m_stub;
         GrpcAsyncClientWorker* m_worker;
         std::shared_ptr< sisl::GrpcTokenClient > m_token_client;
-
-        const StubPtr< ServiceT >& stub() { return m_stub; }
-
-        ::grpc::CompletionQueue* cq() { return &m_worker->cq(); }
     };
 
-    /**
-     * GenericAsyncStub is a wrapper of the grpc::GenericStub which
-     * provides the interface to call generic methods by name.
-     * We assume the Request and Response types are grpc::ByteBuffer.
-     *
-     * Please use GrpcAsyncClient::make_generic_stub() to create GenericAsyncStub.
-     */
-
+    // -----------------------------------------------------------------------
+    // GenericAsyncStub
+    //
+    // Wraps a grpc::GenericStub and a worker.  Use call() to obtain a
+    // GrpcUnarySender<ByteBuffer, ByteBuffer> for unary byte-buffer RPCs.
+    // PrepareUnaryCall handles gRPC framing internally — same one-CQ-event
+    // path as the typed stub, no multi-step streaming protocol needed.
+    // -----------------------------------------------------------------------
     struct GenericAsyncStub {
-        GenericAsyncStub(std::unique_ptr< grpc::GenericStub > stub, GrpcAsyncClientWorker* worker,
+        using UPtr = std::unique_ptr< GenericAsyncStub >;
+
+        GenericAsyncStub(std::unique_ptr< ::grpc::GenericStub > stub, GrpcAsyncClientWorker* worker,
                          std::shared_ptr< sisl::GrpcTokenClient > token_client) :
-                m_generic_stub(std::move(stub)), m_worker(worker), m_token_client(token_client) {}
+                m_stub{std::move(stub)}, m_worker{worker}, m_token_client{std::move(token_client)} {}
 
-        void prepare_and_send_unary_generic(ClientRpcDataInternal< grpc::ByteBuffer, grpc::ByteBuffer >* data,
-                                            const grpc::ByteBuffer& request, const std::string& method,
-                                            uint32_t deadline);
+        GrpcUnarySender< ::grpc::ByteBuffer, ::grpc::ByteBuffer >
+        call(const ::grpc::ByteBuffer& req, const std::string& method, uint32_t deadline,
+             std::span< const std::pair< std::string, std::string > > metadata = {}) {
+            // PrepareUnaryCall is the "prepare" variant — StartCall() must be called
+            // before Finish(). The typed AsyncXxx stubs call StartCall internally,
+            // so we mirror that here to keep GrpcUnaryOpState uniform.
+            typename GrpcUnarySender< ::grpc::ByteBuffer, ::grpc::ByteBuffer >::StartFn fn =
+                [stub = m_stub.get(), method](::grpc::ClientContext* ctx, const ::grpc::ByteBuffer& r,
+                                              ::grpc::CompletionQueue* cq_ptr)
+                -> std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::grpc::ByteBuffer > > {
+                auto reader = stub->PrepareUnaryCall(ctx, method, r, cq_ptr);
+                reader->StartCall();
+                return std::unique_ptr< ::grpc::ClientAsyncResponseReaderInterface< ::grpc::ByteBuffer > >(
+                    reader.release());
+            };
+            return GrpcUnarySender< ::grpc::ByteBuffer, ::grpc::ByteBuffer >{
+                req, std::move(fn), deadline, {metadata.begin(), metadata.end()}, cq(), m_token_client};
+        }
 
-        void call_unary(const grpc::ByteBuffer& request, const std::string& method,
-                        const generic_unary_callback_t& callback, uint32_t deadline);
+        ::grpc::CompletionQueue* cq() { return &m_worker->cq(); }
 
-        void call_rpc(const generic_req_builder_cb_t& builder_cb, const std::string& method,
-                      const generic_rpc_comp_cb_t& done_cb, uint32_t deadline);
-
-        // futures version of call_unary
-        GrpcAsyncResult< grpc::ByteBuffer > call_unary(const grpc::ByteBuffer& request, const std::string& method,
-                                                       uint32_t deadline);
-
-        GrpcAsyncResult< GenericClientResponse > call_unary(const io_blob_list_t& request, const std::string& method,
-                                                            uint32_t deadline);
-
-        std::unique_ptr< grpc::GenericStub > m_generic_stub;
+        std::unique_ptr< ::grpc::GenericStub > m_stub;
         GrpcAsyncClientWorker* m_worker;
         std::shared_ptr< sisl::GrpcTokenClient > m_token_client;
-
-        grpc::CompletionQueue* cq() { return &m_worker->cq(); }
     };
 
     template < typename T, typename... Ts >
@@ -490,13 +446,17 @@ public:
 
     template < typename ServiceT >
     auto make_stub(const std::string& worker) {
-        auto w = GrpcAsyncClientWorker::get_worker(worker);
+        auto* w = GrpcAsyncClientWorker::get_worker(worker);
         if (w == nullptr) { throw std::runtime_error("worker thread not available"); }
-
         return std::make_unique< AsyncStub< ServiceT > >(ServiceT::NewStub(m_channel), w, m_token_client);
     }
 
-    std::unique_ptr< GenericAsyncStub > make_generic_stub(const std::string& worker);
+    auto make_generic_stub(const std::string& worker) {
+        auto* w = GrpcAsyncClientWorker::get_worker(worker);
+        if (w == nullptr) { throw std::runtime_error("worker thread not available"); }
+        return std::make_unique< GenericAsyncStub >(std::make_unique< ::grpc::GenericStub >(m_channel), w,
+                                                    m_token_client);
+    }
 };
 
 } // namespace sisl

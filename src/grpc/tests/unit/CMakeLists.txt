@@ -18,12 +18,7 @@ elseif (DEFINED THREAD_SANITIZER_ON AND THREAD_SANITIZER_ON)
     set_tests_properties(Auth_Test PROPERTIES DISABLED TRUE)
 endif()
 
-add_executable(client_test
-      client_test.cpp
-  )
-target_link_libraries(client_test
-    sisl_grpc
-    GTest::gmock
-    ${COMMON_DEPS}
-  )
-  add_test(NAME Client_Test COMMAND client_test)
+
+add_executable(client_test client_test.cpp)
+target_link_libraries(client_test sisl_grpc GTest::gmock)
+add_test(NAME Client_Test COMMAND client_test)

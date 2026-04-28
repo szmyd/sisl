@@ -13,9 +13,10 @@
  *
  *********************************************************************************/
 #include <memory>
+
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
-#include <mutex>
+#include <stdexec/execution.hpp>
 
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -71,7 +72,6 @@ public:
             LOGERROR("register service failed");
             return false;
         }
-
         return true;
     }
 
@@ -109,6 +109,17 @@ public:
     }
 };
 
+// Synchronously executes a generic RPC and returns the final status.
+static ::grpc::Status sync_generic_call(GrpcAsyncClient::GenericAsyncStub& stub, const ::grpc::ByteBuffer& req,
+                                        const std::string& method, uint32_t deadline) {
+    ::grpc::Status status;
+    stdexec::sync_wait(stub.call(req, method, deadline) | stdexec::let_error([&status](::grpc::Status s) noexcept {
+                           status = std::move(s);
+                           return stdexec::just(::grpc::ByteBuffer{});
+                       }));
+    return status;
+}
+
 class AuthBaseTest : public ::testing::Test {
 public:
     void SetUp() override {}
@@ -122,7 +133,7 @@ public:
     }
 
     void grpc_server_start(const std::string& server_address, std::shared_ptr< MockTokenVerifier > auth_mgr) {
-        LOGINFO("Start echo and ping server on {}...", server_address);
+        LOGINFO("Start echo server on {}...", server_address);
         m_grpc_server = GrpcServer::make(server_address, auth_mgr, 4, "", "");
         m_echo_impl = new EchoServiceImpl();
         m_echo_impl->register_service(m_grpc_server);
@@ -134,55 +145,28 @@ public:
                                             [](boost::intrusive_ptr< GenericRpcData >&) { return true; });
     }
 
-    void process_echo_reply() {
-        m_echo_received.store(true);
-        m_cv.notify_all();
+    void call_async_echo(EchoRequest& req, EchoReply& reply, ::grpc::Status& status) {
+        auto result = stdexec::sync_wait(m_echo_stub->call(req, &EchoService::StubInterface::AsyncEcho, 1) |
+                                         stdexec::let_error([&status](::grpc::Status s) noexcept {
+                                             status = std::move(s);
+                                             return stdexec::just(EchoReply{});
+                                         }));
+        if (result) { reply = std::get< 0 >(*result); }
     }
 
-    void call_async_echo(EchoRequest& req, EchoReply& reply, ::grpc::Status& status) {
-        m_echo_stub->call_unary< EchoRequest, EchoReply >(
-            req, &EchoService::StubInterface::AsyncEcho,
-            [&reply, &status, this](EchoReply& reply_, ::grpc::Status& status_) {
-                reply = reply_;
-                status = status_;
-                process_echo_reply();
-            },
-            1);
-        {
-            std::unique_lock lk(m_wait_mtx);
-            m_cv.wait(lk, [this]() { return m_echo_received.load(); });
-        }
+    void call_async_echo_metadata(EchoRequest& req, EchoReply& reply, ::grpc::Status& status) {
+        auto result = stdexec::sync_wait(
+            m_echo_stub->call(req, &EchoService::StubInterface::AsyncEchoMetadata, 1, grpc_metadata) |
+            stdexec::let_error([&status](::grpc::Status s) noexcept {
+                status = std::move(s);
+                return stdexec::just(EchoReply{});
+            }));
+        if (result) { reply = std::get< 0 >(*result); }
     }
 
     void call_async_generic_rpc(::grpc::Status& status) {
         ::grpc::ByteBuffer req;
-        m_generic_stub->call_unary(
-            req, GENERIC_METHOD,
-            [&status, this](::grpc::ByteBuffer&, ::grpc::Status& status_) {
-                status = status_;
-                m_generic_received.store(true);
-                m_cv.notify_all();
-            },
-            1);
-        {
-            std::unique_lock lk(m_wait_mtx);
-            m_cv.wait(lk, [this]() { return m_generic_received.load(); });
-        }
-    }
-
-    void call_async_echo_metadata(EchoRequest& req, EchoReply& reply, ::grpc::Status& status) {
-        m_echo_stub->call_unary< EchoRequest, EchoReply >(
-            req, &EchoService::StubInterface::AsyncEchoMetadata,
-            [&reply, &status, this](EchoReply& reply_, ::grpc::Status& status_) {
-                reply = reply_;
-                status = status_;
-                process_echo_reply();
-            },
-            1, grpc_metadata);
-        {
-            std::unique_lock lk(m_wait_mtx);
-            m_cv.wait(lk, [this]() { return m_echo_received.load(); });
-        }
+        status = sync_generic_call(*m_generic_stub, req, GENERIC_METHOD, 1);
     }
 
 protected:
@@ -192,19 +176,13 @@ protected:
     std::unique_ptr< GrpcAsyncClient > m_async_grpc_client;
     std::unique_ptr< GrpcAsyncClient::AsyncStub< EchoService > > m_echo_stub;
     std::unique_ptr< GrpcAsyncClient::GenericAsyncStub > m_generic_stub;
-    std::atomic_bool m_echo_received{false};
-    std::atomic_bool m_generic_received{false};
-    std::mutex m_wait_mtx;
-    std::condition_variable m_cv;
 };
 
 class AuthDisableTest : public AuthBaseTest {
 public:
     void SetUp() override {
-        // start grpc server without auth
         grpc_server_start(grpc_server_addr, nullptr);
 
-        // Client without auth
         m_async_grpc_client = std::make_unique< GrpcAsyncClient >(grpc_server_addr, "", "");
         m_async_grpc_client->init();
         GrpcAsyncClientWorker::create_worker("worker-1", 4);
@@ -217,7 +195,6 @@ public:
 
 TEST_F(AuthDisableTest, allow_on_disabled_mode) {
     EchoRequest req;
-    // server sets the same message as response
     req.set_message("dummy_msg");
     EchoReply reply;
     ::grpc::Status status;
@@ -226,7 +203,7 @@ TEST_F(AuthDisableTest, allow_on_disabled_mode) {
     EXPECT_EQ(req.message(), reply.message());
 
     ::grpc::Status generic_status;
-    call_async_generic_rpc(status);
+    call_async_generic_rpc(generic_status);
     EXPECT_TRUE(generic_status.ok());
 }
 
@@ -241,11 +218,9 @@ TEST_F(AuthDisableTest, metadata) {
 class AuthServerOnlyTest : public AuthBaseTest {
 public:
     void SetUp() override {
-        // start grpc server with auth
         m_auth_mgr = std::shared_ptr< MockTokenVerifier >(new MockTokenVerifier(g_auth_header));
         grpc_server_start(grpc_server_addr, m_auth_mgr);
 
-        // Client without auth
         m_async_grpc_client = std::make_unique< GrpcAsyncClient >(grpc_server_addr, "", "");
         m_async_grpc_client->init();
         GrpcAsyncClientWorker::create_worker("worker-2", 4);
@@ -258,7 +233,6 @@ public:
 
 TEST_F(AuthServerOnlyTest, fail_on_no_client_auth) {
     EchoRequest req;
-    // server sets the same message as response
     req.set_message("dummy_msg");
     EchoReply reply;
     ::grpc::Status status;
@@ -281,11 +255,9 @@ public:
 class AuthEnableTest : public AuthBaseTest {
 public:
     void SetUp() override {
-        // start grpc server with auth
         m_auth_mgr = std::shared_ptr< MockTokenVerifier >(new MockTokenVerifier(g_auth_header));
         grpc_server_start(grpc_server_addr, m_auth_mgr);
 
-        // Client with auth
         m_token_client = std::make_shared< MockGrpcTokenClient >(g_auth_header);
         m_async_grpc_client = std::make_unique< GrpcAsyncClient >(grpc_server_addr, m_token_client, "", "");
         m_async_grpc_client->init();
@@ -310,13 +282,12 @@ TEST_F(AuthEnableTest, allow_with_auth) {
     EXPECT_EQ(req.message(), reply.message());
 
     ::grpc::Status generic_status;
-    call_async_generic_rpc(status);
+    call_async_generic_rpc(generic_status);
     EXPECT_TRUE(generic_status.ok());
 }
 
 // sync client
 class EchoAndPingClient : public GrpcSyncClient {
-
 public:
     using GrpcSyncClient::GrpcSyncClient;
     void init() override {
@@ -343,7 +314,7 @@ TEST_F(AuthEnableTest, allow_sync_client_with_auth) {
     EXPECT_EQ(req.message(), reply.message());
 }
 
-void validate_generic_reply(const std::string& method, ::grpc::Status& status) {
+static void validate_generic_reply(const std::string& method, ::grpc::Status& status) {
     if (method == "method1" || method == "method2") {
         EXPECT_TRUE(status.ok());
     } else {
@@ -390,20 +361,14 @@ TEST(GenericServiceDeathTest, basic_test) {
     GrpcAsyncClientWorker::create_worker("generic_worker", 1);
     auto generic_stub = client->make_generic_stub("generic_worker");
     ::grpc::ByteBuffer cli_buf;
-    generic_stub->call_unary(
-        cli_buf, "method1",
-        [method = "method1"](::grpc::ByteBuffer&, ::grpc::Status& status) { validate_generic_reply(method, status); },
-        1);
-    generic_stub->call_unary(
-        cli_buf, "method2",
-        [method = "method2"](::grpc::ByteBuffer&, ::grpc::Status& status) { validate_generic_reply(method, status); },
-        1);
-    generic_stub->call_unary(
-        cli_buf, "method_unknown",
-        [method = "method_unknown"](::grpc::ByteBuffer&, ::grpc::Status& status) {
-            validate_generic_reply(method, status);
-        },
-        1);
+
+    for (auto const& method : {"method1", "method2", "method_unknown"}) {
+        auto status = sync_generic_call(*generic_stub, cli_buf, method, 1);
+        validate_generic_reply(method, status);
+    }
+
+    g_grpc_server->shutdown();
+    delete g_grpc_server;
 }
 
 } // namespace sisl::grpc::testing
