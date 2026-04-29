@@ -419,7 +419,7 @@ private:
     }
 
     std::pair< RangeKey< K >, sisl::byte_view > extract_matched_kv(const ValueEntryRange& ventry,
-                                                                   const small_range_t& input_range) const {
+                                                                    const small_range_t& input_range) const {
         small_range_t key_range{std::max(ventry.m_range.first, input_range.first),
                                 std::min(ventry.m_range.second, input_range.second)};
 
@@ -434,6 +434,9 @@ private:
 
 template < typename K >
 thread_local sisl::RangeHashMap< K >* sisl::RangeHashMap< K >::s_cur_hash_map{nullptr};
+
+template < typename K >
+thread_local std::vector< RangeKey< K > > sisl::RangeHashMap< K >::s_kviews;
 
 ///////////////////////////////////////////// HashBucket Definitions ///////////////////////////////////
 template < typename K >

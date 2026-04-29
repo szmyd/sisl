@@ -22,4 +22,10 @@ namespace sisl {
 
 ENUM(hash_op_t, uint8_t, CREATE, ACCESS, DELETE, RESIZE)
 
+// Sentinel type for "no access callback" — compiles to zero instructions.
+struct NullCacheCb {
+    template < typename... Args >
+    constexpr void operator()(Args&&...) const noexcept {}
+};
+
 } // namespace sisl

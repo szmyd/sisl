@@ -26,10 +26,8 @@
 
 namespace sisl {
 
+// Convenience type aliases — kept for call-site use; the class itself is now templated.
 template < typename K, typename V >
-class SimpleHashBucket;
-
-template < typename K >
 using key_access_cb_t = std::function< void(const ValueEntryBase&, const K&, const hash_op_t) >;
 
 template < typename K, typename V >
@@ -37,24 +35,26 @@ using key_extractor_cb_t = std::function< K(const V&) >;
 
 static constexpr size_t s_start_seed = 0; // TODO: Pickup a better seed
 
-///////////////////////////////////////////// RangeHashMap Declaration ///////////////////////////////////
-template < typename K, typename V >
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+class SimpleHashBucket;
+
+///////////////////////////////////////////// SimpleHashMap Declaration ///////////////////////////////////
+template < typename K, typename V, typename KeyExtractor, typename AccessCb = NullCacheCb >
 class SimpleHashMap {
 private:
     uint32_t m_nbuckets;
-    SimpleHashBucket< K, V >* m_buckets;
-    key_extractor_cb_t< K, V > m_key_extract_cb;
-    key_access_cb_t< K > m_key_access_cb;
+    SimpleHashBucket< K, V, KeyExtractor, AccessCb >* m_buckets;
+    KeyExtractor m_key_extract_cb;
+    [[no_unique_address]] AccessCb m_key_access_cb;
 
-    static thread_local SimpleHashMap< K, V >* s_cur_hash_map;
+    static thread_local SimpleHashMap< K, V, KeyExtractor, AccessCb >* s_cur_hash_map;
 
 #ifdef GLOBAL_HASHSET_LOCK
     mutable std::mutex m;
 #endif
 
 public:
-    SimpleHashMap(uint32_t nBuckets, const key_extractor_cb_t< K, V >& key_extractor,
-                  key_access_cb_t< K > access_cb = nullptr);
+    SimpleHashMap(uint32_t nBuckets, KeyExtractor key_extractor, AccessCb access_cb = {});
     ~SimpleHashMap();
 
     bool insert(const K& key, const V& value);
@@ -65,14 +65,14 @@ public:
     bool update(const K& key, auto&& update_cb);
     bool upsert_or_delete(const K& key, auto&& update_or_delete_cb);
 
-    static void set_current_instance(SimpleHashMap< K, V >* hmap) { s_cur_hash_map = hmap; }
-    static SimpleHashMap< K, V >* get_current_instance() { return s_cur_hash_map; }
-    static key_access_cb_t< K >& get_access_cb() { return get_current_instance()->m_key_access_cb; }
-    static key_extractor_cb_t< K, V >& extractor_cb() { return get_current_instance()->m_key_extract_cb; }
+    static void set_current_instance(SimpleHashMap< K, V, KeyExtractor, AccessCb >* hmap) { s_cur_hash_map = hmap; }
+    static SimpleHashMap< K, V, KeyExtractor, AccessCb >* get_current_instance() { return s_cur_hash_map; }
+    static AccessCb& get_access_cb() { return get_current_instance()->m_key_access_cb; }
+    static KeyExtractor& extractor_cb() { return get_current_instance()->m_key_extract_cb; }
 
     template < typename... Args >
     static void call_access_cb(Args&&... args) {
-        if (get_current_instance()->m_key_access_cb) {
+        if constexpr (!std::is_same_v< AccessCb, NullCacheCb >) {
             (get_current_instance()->m_key_access_cb)(std::forward< Args >(args)...);
         }
     }
@@ -83,8 +83,8 @@ public:
     }
 
 private:
-    SimpleHashBucket< K, V >& get_bucket(const K& key) const;
-    SimpleHashBucket< K, V >& get_bucket(size_t hash_code) const;
+    SimpleHashBucket< K, V, KeyExtractor, AccessCb >& get_bucket(const K& key) const;
+    SimpleHashBucket< K, V, KeyExtractor, AccessCb >& get_bucket(size_t hash_code) const;
 };
 
 ///////////////////////////////////////////// MultiEntryHashNode Definitions ///////////////////////////////////
@@ -96,11 +96,12 @@ struct SingleEntryHashNode : public ValueEntryBase, public boost::intrusive::sli
 
 ///////////////////////////////////////////// ValueEntryRange Definitions ///////////////////////////////////
 
-template < typename K, typename V >
-thread_local sisl::SimpleHashMap< K, V >* sisl::SimpleHashMap< K, V >::s_cur_hash_map{nullptr};
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+thread_local sisl::SimpleHashMap< K, V, KeyExtractor, AccessCb >*
+    sisl::SimpleHashMap< K, V, KeyExtractor, AccessCb >::s_cur_hash_map{nullptr};
 
 ///////////////////////////////////////////// SimpleHashBucket Definitions ///////////////////////////////////
-template < typename K, typename V >
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
 class SimpleHashBucket {
 private:
 #ifndef GLOBAL_HASHSET_LOCK
@@ -128,7 +129,7 @@ public:
         SingleEntryHashNode< V >* n = nullptr;
         auto it = m_list.begin();
         for (auto itend{m_list.end()}; it != itend; ++it) {
-            const K k = SimpleHashMap< K, V >::extractor_cb()(it->m_value);
+            const K k = SimpleHashMap< K, V, KeyExtractor, AccessCb >::extractor_cb()(it->m_value);
             if (input_key > k) {
                 break;
             } else if (input_key == k) {
@@ -156,7 +157,7 @@ public:
 #endif
         bool found{false};
         for (const auto& n : m_list) {
-            const K k = SimpleHashMap< K, V >::extractor_cb()(n.m_value);
+            const K k = SimpleHashMap< K, V, KeyExtractor, AccessCb >::extractor_cb()(n.m_value);
             if (input_key > k) {
                 break;
             } else if (input_key == k) {
@@ -198,7 +199,7 @@ public:
 
         auto it = m_list.begin();
         for (auto itend{m_list.end()}; it != itend; ++it) {
-            const K k = SimpleHashMap< K, V >::extractor_cb()(it->m_value);
+            const K k = SimpleHashMap< K, V, KeyExtractor, AccessCb >::extractor_cb()(it->m_value);
             if (input_key > k) {
                 break;
             } else if (input_key == k) {
@@ -232,7 +233,7 @@ public:
 #endif
         bool found{false};
         for (auto& n : m_list) {
-            const K k = SimpleHashMap< K, V >::extractor_cb()(n.m_value);
+            const K k = SimpleHashMap< K, V, KeyExtractor, AccessCb >::extractor_cb()(n.m_value);
             if (input_key > k) {
                 break;
             } else if (input_key == k) {
@@ -247,7 +248,7 @@ public:
 
 private:
     static void access_cb(const SingleEntryHashNode< V >& node, const K& key, hash_op_t op) {
-        SimpleHashMap< K, V >::call_access_cb((const ValueEntryBase&)node, key, op);
+        SimpleHashMap< K, V, KeyExtractor, AccessCb >::call_access_cb((const ValueEntryBase&)node, key, op);
     }
 
     bool erase_unsafe(const K& input_key, V& out_val, bool call_access_cb) {
@@ -255,7 +256,7 @@ private:
 
         auto it = m_list.begin();
         for (auto itend{m_list.end()}; it != itend; ++it) {
-            const K k = SimpleHashMap< K, V >::extractor_cb()(it->m_value);
+            const K k = SimpleHashMap< K, V, KeyExtractor, AccessCb >::extractor_cb()(it->m_value);
             if (input_key > k) {
                 break;
             } else if (input_key == k) {
@@ -276,20 +277,20 @@ private:
 };
 
 ///////////////////////////////////////////// SimpleHashMap Definitions ///////////////////////////////////
-template < typename K, typename V >
-SimpleHashMap< K, V >::SimpleHashMap(uint32_t nBuckets, const key_extractor_cb_t< K, V >& extract_cb,
-                                     key_access_cb_t< K > access_cb) :
-        m_nbuckets{nBuckets}, m_key_extract_cb{extract_cb}, m_key_access_cb{std::move(access_cb)} {
-    m_buckets = new SimpleHashBucket< K, V >[nBuckets];
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+SimpleHashMap< K, V, KeyExtractor, AccessCb >::SimpleHashMap(uint32_t nBuckets, KeyExtractor key_extractor,
+                                                             AccessCb access_cb) :
+        m_nbuckets{nBuckets}, m_key_extract_cb{std::move(key_extractor)}, m_key_access_cb{std::move(access_cb)} {
+    m_buckets = new SimpleHashBucket< K, V, KeyExtractor, AccessCb >[nBuckets];
 }
 
-template < typename K, typename V >
-SimpleHashMap< K, V >::~SimpleHashMap() {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+SimpleHashMap< K, V, KeyExtractor, AccessCb >::~SimpleHashMap() {
     delete[] m_buckets;
 }
 
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::insert(const K& key, const V& value) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::insert(const K& key, const V& value) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -297,8 +298,8 @@ bool SimpleHashMap< K, V >::insert(const K& key, const V& value) {
     return get_bucket(key).insert(key, value, false /* overwrite_ok */);
 }
 
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::upsert(const K& key, const V& value) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::upsert(const K& key, const V& value) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -306,8 +307,8 @@ bool SimpleHashMap< K, V >::upsert(const K& key, const V& value) {
     return get_bucket(key).insert(key, value, true /* overwrite_ok */);
 }
 
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::get(const K& key, V& out_val) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::get(const K& key, V& out_val) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -315,8 +316,8 @@ bool SimpleHashMap< K, V >::get(const K& key, V& out_val) {
     return get_bucket(key).get(key, out_val);
 }
 
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::erase(const K& key, V& out_val) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::erase(const K& key, V& out_val) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -324,8 +325,8 @@ bool SimpleHashMap< K, V >::erase(const K& key, V& out_val) {
     return get_bucket(key).erase(key, out_val);
 }
 
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::try_erase(const K& key) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::try_erase(const K& key) {
     set_current_instance(this);
     return get_bucket(key).try_erase(key);
 }
@@ -342,8 +343,8 @@ bool SimpleHashMap< K, V >::try_erase(const K& key) {
 ///    b) Return true from callback - in that case it will behave like erase operation of the KV
 ///
 /// Returns true if the value was inserted
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::upsert_or_delete(const K& key, auto&& update_or_delete_cb) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::upsert_or_delete(const K& key, auto&& update_or_delete_cb) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -351,8 +352,8 @@ bool SimpleHashMap< K, V >::upsert_or_delete(const K& key, auto&& update_or_dele
     return get_bucket(key).upsert_or_delete(key, std::move(update_or_delete_cb));
 }
 
-template < typename K, typename V >
-bool SimpleHashMap< K, V >::update(const K& key, auto&& update_cb) {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+bool SimpleHashMap< K, V, KeyExtractor, AccessCb >::update(const K& key, auto&& update_cb) {
 #ifdef GLOBAL_HASHSET_LOCK
     std::lock_guard< std::mutex > lk(m);
 #endif
@@ -360,13 +361,15 @@ bool SimpleHashMap< K, V >::update(const K& key, auto&& update_cb) {
     return get_bucket(key).update(key, std::move(update_cb));
 }
 
-template < typename K, typename V >
-SimpleHashBucket< K, V >& SimpleHashMap< K, V >::get_bucket(const K& key) const {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+SimpleHashBucket< K, V, KeyExtractor, AccessCb >&
+SimpleHashMap< K, V, KeyExtractor, AccessCb >::get_bucket(const K& key) const {
     return (m_buckets[compute_hash(key) % m_nbuckets]);
 }
 
-template < typename K, typename V >
-SimpleHashBucket< K, V >& SimpleHashMap< K, V >::get_bucket(size_t hash_code) const {
+template < typename K, typename V, typename KeyExtractor, typename AccessCb >
+SimpleHashBucket< K, V, KeyExtractor, AccessCb >&
+SimpleHashMap< K, V, KeyExtractor, AccessCb >::get_bucket(size_t hash_code) const {
     return (m_buckets[hash_code % m_nbuckets]);
 }
 

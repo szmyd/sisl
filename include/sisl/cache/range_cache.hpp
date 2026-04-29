@@ -25,6 +25,22 @@ namespace sisl {
 template < typename K >
 class RangeCache {
 private:
+    // Named functors so the types are known at class-definition time — eliminates
+    // std::function virtual dispatch on every extract/access callback from the hashmap.
+    struct ValueExtractorFn {
+        RangeCache* self;
+        sisl::byte_view operator()(const sisl::byte_view& inp, uint32_t nth, uint32_t count) const {
+            return self->extract_value(inp, nth, count);
+        }
+    };
+
+    struct OnHashOp {
+        RangeCache* self;
+        void operator()(const CacheRecord& r, const RangeKey< K >& key, hash_op_t op, int64_t new_size) const {
+            self->on_hash_operation(r, key, op, new_size);
+        }
+    };
+
     std::shared_ptr< Evictor > m_evictor;
     RangeHashMap< K > m_map;
     uint32_t m_record_family_id;
@@ -36,8 +52,7 @@ public:
     RangeCache(const std::shared_ptr< Evictor >& evictor, const uint32_t num_buckets, const uint32_t per_val_size,
                Evictor::can_evict_cb_t evict_cb = nullptr) :
             m_evictor{evictor},
-            m_map{RangeHashMap< K >(num_buckets, bind_this(RangeCache< K >::extract_value, 3),
-                                    bind_this(RangeCache< K >::on_hash_operation, 4))},
+            m_map{num_buckets, ValueExtractorFn{this}, OnHashOp{this}},
             m_per_value_size{per_val_size} {
         m_record_family_id = m_evictor->register_record_family(Evictor::RecordFamily{.can_evict_cb = evict_cb});
     }

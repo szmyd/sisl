@@ -25,10 +25,21 @@ namespace sisl {
 template < typename K, typename V >
 class SimpleCache {
 private:
+    // Named functor so the type is known at class-definition time — avoids std::function
+    // virtual dispatch on every CREATE/DELETE/ACCESS notification from the hashmap.
+    struct OnHashOp {
+        SimpleCache* self;
+        void operator()(const CacheRecord& r, const K& key, const hash_op_t op) const {
+            self->on_hash_operation(r, key, op);
+        }
+    };
+
+    using ExtractCb = key_extractor_cb_t< K, V >;
+
     std::unique_ptr< CacheMetrics > m_metrics;
     std::shared_ptr< Evictor > m_evictor;
-    key_extractor_cb_t< K, V > m_key_extract_cb;
-    SimpleHashMap< K, V > m_map;
+    ExtractCb m_key_extract_cb;
+    SimpleHashMap< K, V, ExtractCb, OnHashOp > m_map;
     uint32_t m_record_family_id;
     uint32_t m_per_value_size;
 
@@ -36,13 +47,11 @@ private:
 
 public:
     SimpleCache(const std::shared_ptr< Evictor >& evictor, uint32_t num_buckets, uint32_t per_val_size,
-                key_extractor_cb_t< K, V >&& extract_cb, Evictor::eviction_cb_t evict_cb = nullptr) :
+                ExtractCb&& extract_cb, Evictor::eviction_cb_t evict_cb = nullptr) :
             m_metrics{std::make_unique< CacheMetrics >()},
             m_evictor{evictor},
             m_key_extract_cb{std::move(extract_cb)},
-            m_map{num_buckets, m_key_extract_cb,
-                  std::bind(&SimpleCache< K, V >::on_hash_operation, this, std::placeholders::_1, std::placeholders::_2,
-                            std::placeholders::_3)},
+            m_map{num_buckets, m_key_extract_cb, OnHashOp{this}},
             m_per_value_size{per_val_size} {
         // Register the record family callbacks with the evictor:
         // - `can_evict_cb`: Provided by the user of the `SimpleCache`. This callback determines whether a record can be
@@ -92,7 +101,7 @@ public:
 private:
     void on_hash_operation(const CacheRecord& r, const K& key, const hash_op_t op) {
         CacheRecord& record = const_cast< CacheRecord& >(r);
-        const auto hash_code = SimpleHashMap< K, V >::compute_hash(key);
+        const auto hash_code = SimpleHashMap< K, V, ExtractCb, OnHashOp >::compute_hash(key);
 
         switch (op) {
         case hash_op_t::CREATE:

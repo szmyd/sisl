@@ -91,15 +91,18 @@ bool LRUEvictor::LRUPartition::do_evict(const uint32_t record_fid, const uint32_
     size_t evictions_count{0};
     size_t evicted_size{0};
 
+    const auto& can_evict = m_evictor->can_evict_cb(record_fid);
+    const auto& post_evict = m_evictor->post_eviction_cb(record_fid);
+
     auto it = std::begin(m_list);
     while (will_fill(needed_size) && (it != std::end(m_list))) {
         CacheRecord& rec = *it;
         bool eviction_failed{true};
         /* return the next element */
-        if (!rec.is_pinned() && (!m_evictor->can_evict_cb(record_fid) || m_evictor->can_evict_cb(record_fid)(rec))) {
+        if (!rec.is_pinned() && (!can_evict || can_evict(rec))) {
             auto const rec_size = rec.size();
             it = m_list.erase(it);
-            if (m_evictor->post_eviction_cb(record_fid) && !m_evictor->post_eviction_cb(record_fid)(rec)) {
+            if (post_evict && !post_evict(rec)) {
                 // If the post eviction callback fails, we need to reinsert the record
                 // back into the list.
                 it = m_list.insert(it, rec);

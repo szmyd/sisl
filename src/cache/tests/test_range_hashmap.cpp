@@ -44,7 +44,7 @@ protected:
     sisl::Bitset m_inserted_slots{g_max_offset};
 
 protected:
-    void SetUp() override { m_map = std::make_unique< RangeHashMap< uint32_t > >(1000, extract_value, nullptr); }
+    void SetUp() override { m_map = std::make_unique< RangeHashMap< uint32_t > >(1000, extract_value); }
 
     void TearDown() override {
         for (auto& [k, v] : m_shadow_map) {
